@@ -1,0 +1,23 @@
+[Unit]
+Description=SMTP Tunnel Server
+Documentation=https://github.com/x011/smtp-tunnel-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/smtp-tunnel
+ExecStart=/opt/smtp-tunnel/venv/bin/python /opt/smtp-tunnel/server.py -c /etc/smtp-tunnel/config.yaml
+Restart=always
+RestartSec=5
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+# Conservative hardening that should not break normal networking or /etc reads.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

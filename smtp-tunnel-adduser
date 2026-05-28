@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+SMTP Tunnel - Add User Script
+
+Creates a new user and generates a client package (ZIP file).
+
+Version: 1.3.0
+"""
+
+import argparse
+import os
+import sys
+import secrets
+import zipfile
+import tarfile
+import tempfile
+import shutil
+
+# Add current directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from common import load_users, save_users, load_config, UserConfig
+
+
+def generate_secret() -> str:
+    """Generate a secure random secret."""
+    return secrets.token_urlsafe(32)
+
+
+def create_client_config(
+    server_host: str,
+    server_port: int,
+    username: str,
+    secret: str,
+    tunnel_conf: dict = None,
+    smtp_conf: dict = None,
+) -> str:
+    """Generate client config.yaml content."""
+    tunnel_conf = tunnel_conf or {}
+    smtp_conf = smtp_conf or {}
+    keepalive_interval = tunnel_conf.get('keepalive_interval', 0)
+    keepalive_timeout = tunnel_conf.get('keepalive_timeout', 30)
+    reconnect_initial_delay = tunnel_conf.get('reconnect_initial_delay', 2)
+    reconnect_max_delay = tunnel_conf.get('reconnect_max_delay', 30)
+    reconnect_jitter = tunnel_conf.get('reconnect_jitter', 0.2)
+    ehlo_name = smtp_conf.get('ehlo_name', 'client.local')
+
+    return f"""# SMTP Tunnel Client Configuration
+# Generated for user: {username}
+
+client:
+  # Server connection
+  server_host: "{server_host}"
+  server_port: {server_port}
+
+  # Authentication
+  username: "{username}"
+  secret: "{secret}"
+
+  # Local SOCKS5 proxy
+  socks_port: 1080
+  socks_host: "127.0.0.1"
+
+  # CA certificate for server verification
+  ca_cert: "ca.crt"
+
+tunnel:
+  keepalive_interval: {keepalive_interval}
+  keepalive_timeout: {keepalive_timeout}
+  reconnect_initial_delay: {reconnect_initial_delay}
+  reconnect_max_delay: {reconnect_max_delay}
+  reconnect_jitter: {reconnect_jitter}
+
+smtp:
+  ehlo_name: "{ehlo_name}"
+"""
+
+
+def create_client_package(
+    username: str,
+    secret: str,
+    server_host: str,
+    server_port: int,
+    base_dir: str,
+    output_dir: str,
+    tunnel_conf: dict = None,
+    smtp_conf: dict = None,
+) -> str:
+    """
+    Create a ZIP package with everything the client needs.
+
+    Returns:
+        Path to the created ZIP file
+    """
+    # Files to include from base directory
+    client_files = ['client.py', 'common.py', 'requirements.txt']
+
+    # Check for ca.crt in both legacy and production install locations.
+    ca_candidates = [
+        os.path.join(base_dir, 'ca.crt'),
+        '/etc/smtp-tunnel/certs/ca.crt',
+        '/etc/smtp-tunnel/ca.crt',
+    ]
+    ca_cert_path = next((path for path in ca_candidates if os.path.exists(path)), ca_candidates[0])
+    has_ca_cert = os.path.exists(ca_cert_path)
+
+    # Create temporary directory for package
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pkg_dir = os.path.join(tmpdir, username)
+        os.makedirs(pkg_dir)
+
+        # Copy client files
+        for filename in client_files:
+            src = os.path.join(base_dir, filename)
+            if os.path.exists(src):
+                shutil.copy(src, pkg_dir)
+            else:
+                print(f"Warning: {filename} not found, skipping")
+
+        # Copy CA certificate if exists
+        if has_ca_cert:
+            shutil.copy(ca_cert_path, pkg_dir)
+        else:
+            print("Warning: ca.crt not found - client will not be able to verify server")
+
+        # Generate client config
+        config_content = create_client_config(
+            server_host,
+            server_port,
+            username,
+            secret,
+            tunnel_conf=tunnel_conf,
+            smtp_conf=smtp_conf,
+        )
+        config_path = os.path.join(pkg_dir, 'config.yaml')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.write(config_content)
+
+        # Create README for the user
+        readme_content = f"""# SMTP Tunnel Client - {username}
+
+## Quick Start
+
+1. Install dependencies:
+   pip install -r requirements.txt
+
+2. Run the client:
+   python client.py
+
+3. Configure your browser/apps to use SOCKS5 proxy:
+   Host: 127.0.0.1
+   Port: 1080
+
+## Files
+
+- start.bat      - Windows launcher (double-click to run)
+- start.sh       - Linux/Mac launcher (run with ./start.sh)
+- client.py      - The tunnel client
+- common.py      - Shared library
+- config.yaml    - Your configuration (pre-configured)
+- ca.crt         - Server certificate for verification
+- requirements.txt - Python dependencies
+
+## Test Connection
+
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+
+## Easy Start
+
+Windows: Double-click start.bat
+Linux/Mac: Run ./start.sh
+
+## Linux Server Install From Package
+
+Copy smtp-tunnel-client-{username}.tar.gz to the client server, then run:
+
+sudo bash ./install.sh --role client --from-package /path/to/smtp-tunnel-client-{username}.tar.gz
+"""
+        readme_path = os.path.join(pkg_dir, 'README.txt')
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write(readme_content)
+
+        # Create Windows launcher script (start.bat)
+        bat_content = f'''@echo off
+chcp 65001 >nul 2>&1
+title SMTP Tunnel - {username}
+
+echo.
+echo  ╔═══════════════════════════════════════════════════════════╗
+echo  ║                                                           ║
+echo  ║   ███████╗███╗   ███╗████████╗██████╗                     ║
+echo  ║   ██╔════╝████╗ ████║╚══██╔══╝██╔══██╗                    ║
+echo  ║   ███████╗██╔████╔██║   ██║   ██████╔╝                    ║
+echo  ║   ╚════██║██║╚██╔╝██║   ██║   ██╔═══╝                     ║
+echo  ║   ███████║██║ ╚═╝ ██║   ██║   ██║                         ║
+echo  ║   ╚══════╝╚═╝     ╚═╝   ╚═╝   ╚═╝                         ║
+echo  ║                                                           ║
+echo  ║   SMTP Tunnel Proxy Client                                ║
+echo  ║   User: {username:50}║
+echo  ║                                                           ║
+echo  ╚═══════════════════════════════════════════════════════════╝
+echo.
+
+:: Check for Python
+where python >nul 2>&1
+if %errorlevel% neq 0 (
+    where python3 >nul 2>&1
+    if %errorlevel% neq 0 (
+        echo [ERROR] Python not found!
+        echo.
+        echo Please install Python 3.8+ from:
+        echo   https://www.python.org/downloads/
+        echo.
+        echo Make sure to check "Add Python to PATH" during installation.
+        echo.
+        pause
+        exit /b 1
+    )
+    set PYTHON=python3
+) else (
+    set PYTHON=python
+)
+
+echo [INFO] Found Python: %PYTHON%
+
+:: Check/install requirements
+echo [INFO] Checking dependencies...
+%PYTHON% -c "import yaml, cryptography" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [INFO] Installing dependencies...
+    %PYTHON% -m pip install -r requirements.txt --quiet
+    if %errorlevel% neq 0 (
+        echo [ERROR] Failed to install dependencies
+        pause
+        exit /b 1
+    )
+    echo [INFO] Dependencies installed
+)
+
+echo.
+echo [INFO] Starting SMTP Tunnel...
+echo [INFO] SOCKS5 proxy will be available at 127.0.0.1:1080
+echo.
+echo Press Ctrl+C to stop
+echo ─────────────────────────────────────────────────────────────
+echo.
+
+%PYTHON% client.py
+
+echo.
+echo Connection closed.
+echo Press any key to exit...
+pause >nul
+'''
+        bat_path = os.path.join(pkg_dir, 'start.bat')
+        with open(bat_path, 'w', newline='\r\n', encoding='utf-8') as f:
+            f.write(bat_content)
+
+        # Create Linux/Mac launcher script (start.sh)
+        sh_content = f'''#!/bin/bash
+#
+# SMTP Tunnel Client Launcher
+# User: {username}
+#
+
+# Colors
+RED='\\033[0;31m'
+GREEN='\\033[0;32m'
+YELLOW='\\033[1;33m'
+BLUE='\\033[0;34m'
+CYAN='\\033[0;36m'
+NC='\\033[0m'
+
+clear
+echo ""
+echo -e "${{CYAN}}"
+echo "  ╔═══════════════════════════════════════════════════════════╗"
+echo "  ║                                                           ║"
+echo "  ║   ███████╗███╗   ███╗████████╗██████╗                     ║"
+echo "  ║   ██╔════╝████╗ ████║╚══██╔══╝██╔══██╗                    ║"
+echo "  ║   ███████╗██╔████╔██║   ██║   ██████╔╝                    ║"
+echo "  ║   ╚════██║██║╚██╔╝██║   ██║   ██╔═══╝                     ║"
+echo "  ║   ███████║██║ ╚═╝ ██║   ██║   ██║                         ║"
+echo "  ║   ╚══════╝╚═╝     ╚═╝   ╚═╝   ╚═╝                         ║"
+echo "  ║                                                           ║"
+echo "  ║   SMTP Tunnel Proxy Client                                ║"
+echo "  ║   User: {username:50}║"
+echo "  ║                                                           ║"
+echo "  ╚═══════════════════════════════════════════════════════════╝"
+echo -e "${{NC}}"
+echo ""
+
+# Find Python
+if command -v python3 &> /dev/null; then
+    PYTHON=python3
+elif command -v python &> /dev/null; then
+    PYTHON=python
+else
+    echo -e "${{RED}}[ERROR]${{NC}} Python not found!"
+    echo ""
+    echo "Please install Python 3.8+:"
+    echo "  Ubuntu/Debian: sudo apt install python3 python3-pip"
+    echo "  macOS: brew install python3"
+    echo "  Or download from: https://www.python.org/downloads/"
+    echo ""
+    exit 1
+fi
+
+echo -e "${{GREEN}}[INFO]${{NC}} Found Python: $PYTHON"
+
+# Check/install requirements
+echo -e "${{GREEN}}[INFO]${{NC}} Checking dependencies..."
+if ! $PYTHON -c "import yaml, cryptography" &> /dev/null; then
+    echo -e "${{YELLOW}}[INFO]${{NC}} Installing dependencies..."
+    $PYTHON -m pip install -r requirements.txt --quiet
+    if [ $? -ne 0 ]; then
+        echo -e "${{RED}}[ERROR]${{NC}} Failed to install dependencies"
+        echo "Try running: $PYTHON -m pip install -r requirements.txt"
+        exit 1
+    fi
+    echo -e "${{GREEN}}[INFO]${{NC}} Dependencies installed"
+fi
+
+echo ""
+echo -e "${{GREEN}}[INFO]${{NC}} Starting SMTP Tunnel..."
+echo -e "${{GREEN}}[INFO]${{NC}} SOCKS5 proxy will be available at 127.0.0.1:1080"
+echo ""
+echo -e "Press ${{YELLOW}}Ctrl+C${{NC}} to stop"
+echo "─────────────────────────────────────────────────────────────"
+echo ""
+
+$PYTHON client.py
+
+echo ""
+echo -e "${{YELLOW}}Connection closed.${{NC}}"
+'''
+        sh_path = os.path.join(pkg_dir, 'start.sh')
+        with open(sh_path, 'w', encoding='utf-8') as f:
+            f.write(sh_content)
+        os.chmod(sh_path, 0o755)
+
+        # Create package install instructions for server-side/client-service use.
+        install_notes = f"""# Client service install package for {username}
+
+This package contains only this user's client config, the client runtime files,
+requirements, and ca.crt if available. It does not contain server private keys
+or other users' secrets.
+
+Recommended client server install:
+
+1. Install or download the project installer on the client host.
+2. Run:
+
+   sudo bash ./install.sh --role client --from-package /path/to/smtp-tunnel-client-{username}.tar.gz
+
+3. Check logs:
+
+   sudo journalctl -u smtp-tunnel -f
+
+4. Test SOCKS:
+
+   curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+"""
+        with open(os.path.join(pkg_dir, 'INSTALL-LINUX-SERVICE.txt'), 'w', encoding='utf-8') as f:
+            f.write(install_notes)
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Create ZIP file
+        zip_filename = f"{username}.zip"
+        zip_path = os.path.abspath(os.path.join(output_dir, zip_filename))
+
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(pkg_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, tmpdir)
+                    zipf.write(file_path, arcname)
+
+        # Create tar.gz service-install bundle.
+        tar_filename = f"smtp-tunnel-client-{username}.tar.gz"
+        tar_path = os.path.abspath(os.path.join(output_dir, tar_filename))
+        with tarfile.open(tar_path, 'w:gz') as tar:
+            tar.add(pkg_dir, arcname=f"smtp-tunnel-client-{username}")
+
+        return zip_path, tar_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Add a new user to SMTP Tunnel',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s alice                    # Add user 'alice' with auto-generated secret
+  read -rsp 'Secret: ' S; printf '\\n'; printf '%s\\n' "$S" | %(prog)s bob --secret-stdin
+  %(prog)s carol --whitelist 1.2.3.4 --whitelist 10.0.0.0/8
+  %(prog)s dave --no-logging        # Add user without logging
+"""
+    )
+    parser.add_argument('username', help='Username to add')
+    parser.add_argument('--secret', '-s', default=None, help='Secret (auto-generated if not provided)')
+    parser.add_argument('--secret-stdin', action='store_true', help='Read secret from stdin (first line)')
+    parser.add_argument('--whitelist', '-w', action='append', default=[], help='IP whitelist (can specify multiple)')
+    parser.add_argument('--no-logging', action='store_true', help='Disable logging for this user')
+    parser.add_argument('--users-file', '-u', default='/etc/smtp-tunnel/users.yaml', help='Users file (default: /etc/smtp-tunnel/users.yaml)')
+    parser.add_argument('--config', '-c', default='/etc/smtp-tunnel/config.yaml', help='Server config file (default: /etc/smtp-tunnel/config.yaml)')
+    parser.add_argument('--output-dir', '-o', default='.', help='Output directory for ZIP file (default: current)')
+    parser.add_argument('--no-package', '--no-zip', action='store_true', help='Do not generate client ZIP package')
+
+    args = parser.parse_args()
+
+    # Get base directory (where this script is located)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Load existing users
+    users_file = args.users_file
+    if not os.path.isabs(users_file):
+        users_file = os.path.join(base_dir, users_file)
+
+    users = load_users(users_file)
+
+    # Check if user already exists
+    if args.username in users:
+        print(f"Error: User '{args.username}' already exists")
+        return 1
+
+    # Generate secret if not provided
+    if args.secret_stdin:
+        secret = sys.stdin.readline().strip()
+        if not secret:
+            print("Error: --secret-stdin was set but stdin was empty")
+            return 1
+    else:
+        secret = args.secret or generate_secret()
+
+    # Create user config
+    user = UserConfig(
+        username=args.username,
+        secret=secret,
+        whitelist=args.whitelist if args.whitelist else [],
+        logging=not args.no_logging
+    )
+
+    # Add user
+    users[args.username] = user
+
+    # Save users file
+    save_users(users_file, users)
+    print(f"User '{args.username}' added to {users_file}")
+
+    # Generate client package
+    if not args.no_package:
+        # Load server config to get hostname and port
+        config_file = args.config
+        if not os.path.isabs(config_file):
+            config_file = os.path.join(base_dir, config_file)
+
+        try:
+            config_data = load_config(config_file)
+            server_conf = config_data.get('server', {})
+            tunnel_conf = config_data.get('tunnel', {})
+            smtp_conf = config_data.get('smtp', {})
+            server_host = server_conf.get('hostname', 'localhost')
+            server_port = server_conf.get('port', 587)
+        except FileNotFoundError:
+            print(f"Warning: Config file {config_file} not found, using defaults")
+            server_host = 'localhost'
+            server_port = 587
+            tunnel_conf = {}
+            smtp_conf = {}
+
+        output_dir = args.output_dir
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(os.getcwd(), output_dir)
+
+        zip_path, tar_path = create_client_package(
+            username=args.username,
+            secret=secret,
+            server_host=server_host,
+            server_port=server_port,
+            base_dir=base_dir,
+            output_dir=output_dir,
+            tunnel_conf=tunnel_conf,
+            smtp_conf=smtp_conf,
+        )
+
+        print(f"Client package created: {zip_path}")
+        print(f"Client service bundle created: {tar_path}")
+        print()
+        print("Send this ZIP file to the user. They just need to:")
+        print("  1. Extract the ZIP")
+        print("  2. pip install -r requirements.txt")
+        print("  3. python client.py")
+        print()
+        print("For Linux service install, copy the .tar.gz bundle and run:")
+        print(f"  sudo bash ./install.sh --role client --from-package {tar_path}")
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
