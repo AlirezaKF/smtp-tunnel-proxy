@@ -18,11 +18,22 @@ REF="main"
 DOWNLOAD_METHOD="auto"
 KEEP_SOURCE=0
 INSTALL_ARGS=()
+BOOTSTRAP_WORKDIR=""
 
 print_info() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 print_step() { echo -e "${BLUE}[STEP]${NC} $1" >&2; }
+
+cleanup_bootstrap() {
+    if [ "$KEEP_SOURCE" -eq 1 ]; then
+        return 0
+    fi
+    if [ -n "${BOOTSTRAP_WORKDIR:-}" ] && [ -d "${BOOTSTRAP_WORKDIR:-}" ]; then
+        rm -rf "$BOOTSTRAP_WORKDIR"
+    fi
+}
+
 
 usage() {
     cat << EOF
@@ -307,10 +318,10 @@ main() {
     detect_os
     ensure_prerequisites
 
-    local workdir
-    workdir="$(mktemp -d /tmp/smtp-tunnel-bootstrap.XXXXXX)"
+    BOOTSTRAP_WORKDIR="$(mktemp -d /tmp/smtp-tunnel-bootstrap.XXXXXX)"
+    local workdir="$BOOTSTRAP_WORKDIR"
     if [ "$KEEP_SOURCE" -ne 1 ]; then
-        trap 'rm -rf "$workdir"' EXIT
+        trap cleanup_bootstrap EXIT
     fi
 
     print_step "Downloading $REPO at ref $REF"
