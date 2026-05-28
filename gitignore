@@ -1,0 +1,60 @@
+# Runtime configs and secrets
+/etc/smtp-tunnel/
+config.local.yaml
+config.production.yaml
+users.local.yaml
+users.production.yaml
+users.yaml
+
+# Certificates and private keys
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.csr
+*.srl
+ca.*
+server.crt
+server.key
+client.crt
+client.key
+
+# Generated client packages
+*.tar.gz
+*.zip
+smtp-tunnel-client-*
+client-bundles/
+
+# Secrets
+*.secret
+*.token
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and runtime
+*.log
+logs/
+*.pid
+*.sock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
