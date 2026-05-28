@@ -16,8 +16,26 @@ import tarfile
 import tempfile
 import shutil
 
-# Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+def detect_app_dir() -> str:
+    """Find the installed application directory, even when invoked via /usr/local/bin symlink."""
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        script_dir,
+        os.getcwd(),
+        '/opt/smtp-tunnel',
+    ]
+
+    for candidate in candidates:
+        if candidate and os.path.exists(os.path.join(candidate, 'common.py')):
+            return candidate
+
+    return script_dir
+
+
+APP_DIR = detect_app_dir()
+
+# Add application directory to path for imports.
+sys.path.insert(0, APP_DIR)
 
 from common import load_users, save_users, load_config, UserConfig
 
@@ -115,7 +133,7 @@ def create_client_package(
             if os.path.exists(src):
                 shutil.copy(src, pkg_dir)
             else:
-                print(f"Warning: {filename} not found, skipping")
+                print(f"Warning: {filename} not found in {base_dir}, skipping")
 
         # Copy CA certificate if exists
         if has_ca_cert:
@@ -410,8 +428,9 @@ Examples:
 
     args = parser.parse_args()
 
-    # Get base directory (where this script is located)
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Get base directory of application files. This is usually /opt/smtp-tunnel
+    # and still works when this script is invoked through /usr/local/bin.
+    base_dir = APP_DIR
 
     # Load existing users
     users_file = args.users_file
@@ -493,8 +512,10 @@ Examples:
         print("  2. pip install -r requirements.txt")
         print("  3. python client.py")
         print()
-        print("For Linux service install, copy the .tar.gz bundle and run:")
-        print(f"  sudo bash ./install.sh --role client --from-package {tar_path}")
+        print("For Linux service install, copy the .tar.gz bundle to the client server and run:")
+        print("  curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/bootstrap.sh -o /root/bootstrap.sh")
+        print(f"  sudo bash /root/bootstrap.sh --role client --repo GITHUB_USER/REPO_NAME --ref main --from-package {tar_path}")
+        print("Replace GITHUB_USER/REPO_NAME before using the example above.")
 
     return 0
 
