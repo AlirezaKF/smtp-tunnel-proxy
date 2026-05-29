@@ -37,12 +37,19 @@ from common import (
     FRAME_KEEPALIVE,
     FRAME_KEEPALIVE_ACK,
     FrameProtocolError,
+    IPWhitelist,
     MAX_CHANNEL_ID,
+    MODE_NORMAL,
+    MODE_REVERSE_LISTEN,
+    ReverseListenConfig,
     SMTPConfig,
     TunnelConfig,
     TunnelCrypto,
+    UserConfig,
+    build_reverse_listen_config,
     build_smtp_config,
     build_tunnel_config,
+    get_client_mode,
     encode_frame,
     load_config,
     make_connect_payload,
@@ -502,6 +509,285 @@ class TunnelClient:
 
 
 # ============================================================================
+# Reverse Access Node Listener
+# ============================================================================
+
+class ReverseSessionHolder:
+    """Holds the current reverse tunnel session for the SOCKS5 server."""
+
+    def __init__(self):
+        self.active: Optional[TunnelClient] = None
+        self.opening_channels: Set[int] = set()
+        self.pending_channel_data: Dict[int, List[bytes]] = {}
+        self.pending_close_channels: Set[int] = set()
+
+    @property
+    def connected(self) -> bool:
+        return bool(self.active and self.active.connected)
+
+    async def set_active(self, tunnel: TunnelClient):
+        old = self.active
+        self.active = tunnel
+        if old and old is not tunnel and old.connected:
+            logger.warning("Replacing existing reverse tunnel session")
+            await old.disconnect()
+
+    async def clear_if_active(self, tunnel: TunnelClient):
+        if self.active is tunnel:
+            self.active = None
+
+    def _current(self) -> Optional[TunnelClient]:
+        if self.active and self.active.connected:
+            return self.active
+        return None
+
+    async def open_channel(self, host: str, port: int) -> Tuple[int, bool]:
+        tunnel = self._current()
+        if not tunnel:
+            logger.warning(f"No reverse tunnel session available for CONNECT {host}:{port}")
+            return 0, False
+        return await tunnel.open_channel(host, port)
+
+    async def register_channel(self, channel: Channel):
+        tunnel = self._current()
+        if tunnel:
+            await tunnel.register_channel(channel)
+
+    async def send_data(self, channel_id: int, data: bytes):
+        tunnel = self._current()
+        if tunnel:
+            await tunnel.send_data(channel_id, data)
+
+    async def close_channel_remote(self, channel_id: int):
+        tunnel = self._current()
+        if tunnel:
+            await tunnel.close_channel_remote(channel_id)
+
+    async def _close_channel(self, channel: Channel):
+        tunnel = self._current()
+        if tunnel:
+            await tunnel._close_channel(channel)
+        else:
+            try:
+                channel.writer.close()
+                await asyncio.wait_for(channel.writer.wait_closed(), timeout=5.0)
+            except Exception:
+                pass
+
+
+class ReverseAccessListener:
+    """Access Node reverse listener. The VPS dials into this server."""
+
+    def __init__(
+        self,
+        reverse_config: ReverseListenConfig,
+        socks_host: str,
+        socks_port: int,
+        tunnel_config: TunnelConfig = None,
+        smtp_config: SMTPConfig = None
+    ):
+        self.reverse_config = reverse_config
+        self.socks_host = socks_host
+        self.socks_port = socks_port
+        self.tunnel_config = tunnel_config or TunnelConfig()
+        self.smtp_config = smtp_config or SMTPConfig()
+        self.session_holder = ReverseSessionHolder()
+        self.ssl_context = self._create_ssl_context()
+        self.allowed_ips = IPWhitelist(reverse_config.allowed_dialer_ips)
+
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        tls = self.reverse_config.tls
+        if not tls.cert_file or not tls.key_file:
+            raise ValueError("client.reverse.tls.cert_file and key_file are required for reverse-listen mode")
+        if not os.path.exists(tls.cert_file):
+            raise ValueError(f"reverse TLS cert_file does not exist: {tls.cert_file}")
+        if not os.path.exists(tls.key_file):
+            raise ValueError(f"reverse TLS key_file does not exist: {tls.key_file}")
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(tls.cert_file, tls.key_file)
+
+        if self.reverse_config.mtls.enabled:
+            raise ValueError("reverse mTLS is planned for Stage 1b and is not implemented in Stage 1")
+
+        return ctx
+
+    async def _send_line(self, writer: asyncio.StreamWriter, line: str):
+        writer.write(f"{line}\r\n".encode())
+        await writer.drain()
+
+    async def _read_line(self, reader: asyncio.StreamReader) -> Optional[str]:
+        try:
+            data = await asyncio.wait_for(reader.readline(), timeout=60.0)
+            if not data:
+                return None
+            return data.decode('utf-8', errors='replace').strip()
+        except Exception:
+            return None
+
+    async def _expect_ehlo(self, reader: asyncio.StreamReader) -> bool:
+        line = await self._read_line(reader)
+        return bool(line and line.upper().startswith(('EHLO', 'HELO')))
+
+    async def _upgrade_tls(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        transport = writer.transport
+        protocol = writer._protocol
+        loop = asyncio.get_event_loop()
+
+        new_transport = await loop.start_tls(
+            transport, protocol, self.ssl_context, server_side=True
+        )
+        writer._transport = new_transport
+        reader._transport = new_transport
+
+    async def _smtp_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peer_str: str) -> bool:
+        hostname = self.reverse_config.tls.domain or socket.gethostname()
+        await self._send_line(writer, f"220 {hostname} ESMTP Postfix (Ubuntu)")
+
+        if not await self._expect_ehlo(reader):
+            return False
+
+        await self._send_line(writer, f"250-{hostname}")
+        await self._send_line(writer, "250-STARTTLS")
+        await self._send_line(writer, "250-AUTH PLAIN")
+        await self._send_line(writer, "250 8BITMIME")
+
+        line = await self._read_line(reader)
+        if not line or line.upper() != 'STARTTLS':
+            return False
+
+        await self._send_line(writer, "220 2.0.0 Ready to start TLS")
+        await self._upgrade_tls(reader, writer)
+
+        if not await self._expect_ehlo(reader):
+            return False
+
+        await self._send_line(writer, f"250-{hostname}")
+        await self._send_line(writer, "250-AUTH PLAIN")
+        await self._send_line(writer, "250 8BITMIME")
+
+        line = await self._read_line(reader)
+        if not line or not line.upper().startswith('AUTH'):
+            return False
+
+        parts = line.split(' ', 2)
+        if len(parts) < 3 or parts[1].upper() != 'PLAIN':
+            await self._send_line(writer, "535 5.7.8 Authentication failed")
+            return False
+
+        users = {
+            self.reverse_config.auth_username: UserConfig(
+                username=self.reverse_config.auth_username,
+                secret=self.reverse_config.auth_secret,
+            )
+        }
+        valid, username = TunnelCrypto.verify_auth_token_multi_user(parts[2], users)
+        if not valid or username != self.reverse_config.auth_username:
+            logger.warning(f"Reverse authentication failed from {peer_str}")
+            await self._send_line(writer, "535 5.7.8 Authentication failed")
+            await asyncio.sleep(1.0)
+            return False
+
+        await self._send_line(writer, "235 2.7.0 Authentication successful")
+
+        line = await self._read_line(reader)
+        if line != "BINARY":
+            return False
+        await self._send_line(writer, "299 Binary mode activated")
+        return True
+
+    async def handle_dialer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        peer = writer.get_extra_info('peername')
+        peer_ip = peer[0] if peer else "unknown"
+        peer_str = f"{peer[0]}:{peer[1]}" if peer else "unknown"
+        logger.info(f"Reverse dialer connected from {peer_str}")
+
+        if self.allowed_ips and not self.allowed_ips.is_allowed(peer_ip):
+            logger.warning(f"Reverse dialer IP not allowed: {peer_ip}")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        tunnel = None
+        receiver_task = None
+        keepalive_task = None
+
+        try:
+            if not await self._smtp_handshake(reader, writer, peer_str):
+                logger.warning(f"Reverse handshake failed from {peer_str}")
+                return
+
+            tunnel = TunnelClient(
+                ClientConfig(
+                    server_host=peer_ip,
+                    server_port=self.reverse_config.listen_port,
+                    socks_host=self.socks_host,
+                    socks_port=self.socks_port,
+                    username=self.reverse_config.auth_username,
+                    secret=self.reverse_config.auth_secret,
+                ),
+                tunnel_config=self.tunnel_config,
+                smtp_config=self.smtp_config,
+            )
+            tunnel.reader = reader
+            tunnel.writer = writer
+            tunnel.connected = True
+            await self.session_holder.set_active(tunnel)
+
+            logger.info(f"Reverse tunnel session authenticated: {peer_str}")
+            receiver_task = asyncio.create_task(tunnel._receiver_loop())
+            keepalive_task = asyncio.create_task(tunnel.keepalive_loop())
+            await receiver_task
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Reverse listener session error from {peer_str}: {e}")
+        finally:
+            if tunnel:
+                await self.session_holder.clear_if_active(tunnel)
+                await tunnel.disconnect()
+            for task in (receiver_task, keepalive_task):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            logger.info(f"Reverse tunnel session ended: {peer_str}")
+
+    async def start(self):
+        socks = SOCKS5Server(self.session_holder, self.socks_host, self.socks_port)
+        socks_server = await asyncio.start_server(
+            socks.handle_client,
+            socks.host,
+            socks.port,
+            reuse_address=True
+        )
+        reverse_server = await asyncio.start_server(
+            self.handle_dialer,
+            self.reverse_config.listen_host,
+            self.reverse_config.listen_port,
+            reuse_address=True
+        )
+
+        socks_addr = socks_server.sockets[0].getsockname()
+        reverse_addr = reverse_server.sockets[0].getsockname()
+        logger.info(f"SOCKS5 proxy on {socks_addr[0]}:{socks_addr[1]}")
+        logger.info(f"Reverse listener on {reverse_addr[0]}:{reverse_addr[1]}")
+        if self.reverse_config.allowed_dialer_ips:
+            logger.info(f"Reverse allowed dialer IPs: {', '.join(self.reverse_config.allowed_dialer_ips)}")
+        else:
+            logger.warning("reverse.allowed_dialer_ips is empty; any source IP can attempt TLS/auth")
+
+        async with socks_server, reverse_server:
+            await asyncio.gather(
+                socks_server.serve_forever(),
+                reverse_server.serve_forever(),
+            )
+
+
+# ============================================================================
 # SOCKS5 Server
 # ============================================================================
 
@@ -773,7 +1059,9 @@ def check_client_config(config_path: str, args) -> int:
 
     try:
         config_data = load_config(config_path)
+        mode = get_client_mode(config_data)
         config, ca_cert, tunnel_config, smtp_config = build_client_settings(config_data, args)
+        reverse_config = build_reverse_listen_config(config_data) if mode == MODE_REVERSE_LISTEN else None
     except FileNotFoundError:
         print(f"ERROR: config file not found: {config_path}")
         return 1
@@ -781,33 +1069,56 @@ def check_client_config(config_path: str, args) -> int:
         print(f"ERROR: invalid client config: {e}")
         return 1
 
-    if not config.server_host:
-        errors.append("client.server_host is required")
     if not config.socks_host:
         errors.append("client.socks_host is required")
-    if not config.username:
-        errors.append("client.username is required")
-    if not config.secret:
-        errors.append("client.secret is required")
 
-    if ca_cert:
-        if not os.path.exists(ca_cert):
-            errors.append(f"client.ca_cert does not exist: {ca_cert}")
-        elif not os.path.isfile(ca_cert):
-            errors.append(f"client.ca_cert is not a file: {ca_cert}")
+    if mode == MODE_NORMAL:
+        if not config.server_host:
+            errors.append("client.server_host is required")
+        if not config.username:
+            errors.append("client.username is required")
+        if not config.secret:
+            errors.append("client.secret is required")
+
+        if ca_cert:
+            if not os.path.exists(ca_cert):
+                errors.append(f"client.ca_cert does not exist: {ca_cert}")
+            elif not os.path.isfile(ca_cert):
+                errors.append(f"client.ca_cert is not a file: {ca_cert}")
+        else:
+            warnings.append("client.ca_cert is not configured; TLS verification will be disabled")
     else:
-        warnings.append("client.ca_cert is not configured; TLS verification will be disabled")
+        if not reverse_config.auth_username:
+            errors.append("client.reverse.auth_username is required")
+        if not reverse_config.auth_secret:
+            errors.append("client.reverse.auth_secret or auth_secret_file is required")
+        if not reverse_config.tls.cert_file:
+            errors.append("client.reverse.tls.cert_file is required")
+        elif not os.path.isfile(reverse_config.tls.cert_file):
+            errors.append(f"client.reverse.tls.cert_file does not exist: {reverse_config.tls.cert_file}")
+        if not reverse_config.tls.key_file:
+            errors.append("client.reverse.tls.key_file is required")
+        elif not os.path.isfile(reverse_config.tls.key_file):
+            errors.append(f"client.reverse.tls.key_file does not exist: {reverse_config.tls.key_file}")
+        if reverse_config.mtls.enabled:
+            errors.append("reverse mTLS is planned for Stage 1b and is not implemented in Stage 1")
 
     if tunnel_config.keepalive_interval > 0 and tunnel_config.keepalive_timeout <= 0:
         errors.append("tunnel.keepalive_timeout must be positive when keepalive is enabled")
 
     print("Client config check")
     print(f"  Config: {config_path}")
-    print(f"  Server: {config.server_host}:{config.server_port}")
+    print(f"  Mode:   {mode}")
+    if mode == MODE_NORMAL:
+        print(f"  Server: {config.server_host}:{config.server_port}")
+        print(f"  CA cert: {ca_cert or '(not configured)'}")
+    else:
+        print(f"  Reverse listen: {reverse_config.listen_host}:{reverse_config.listen_port}")
+        print(f"  Reverse TLS cert: {reverse_config.tls.cert_file}")
+        print(f"  Reverse allowed IPs: {', '.join(reverse_config.allowed_dialer_ips) or '(none)'}")
     print(f"  SOCKS:  {config.socks_host}:{config.socks_port}")
     print(f"  EHLO:   {smtp_config.ehlo_name}")
     print(f"  Keepalive interval: {tunnel_config.keepalive_interval:g}s")
-    print(f"  CA cert: {ca_cert or '(not configured)'}")
 
     for warning in warnings:
         print(f"WARNING: {warning}")
@@ -846,10 +1157,30 @@ def main():
         return check_client_config(args.config, args)
 
     try:
+        mode = get_client_mode(config_data)
         config, ca_cert, tunnel_config, smtp_config = build_client_settings(config_data, args)
     except Exception as e:
         logger.error(f"Invalid client config: {e}")
         return 1
+
+    if mode == MODE_REVERSE_LISTEN:
+        try:
+            reverse_config = build_reverse_listen_config(config_data)
+            listener = ReverseAccessListener(
+                reverse_config,
+                config.socks_host,
+                config.socks_port,
+                tunnel_config,
+                smtp_config,
+            )
+        except Exception as e:
+            logger.error(f"Invalid reverse-listen config: {e}")
+            return 1
+
+        try:
+            return asyncio.run(listener.start())
+        except KeyboardInterrupt:
+            return 0
 
     if not config.username:
         logger.error("No username configured!")
