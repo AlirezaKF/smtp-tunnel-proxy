@@ -183,6 +183,9 @@ tunnel:
   connections: 4
   connect_timeout: 10
 
+performance:
+  profile: balanced
+
 metrics:
   enabled: true
   log_interval: 30
@@ -244,6 +247,30 @@ wait
 ```
 
 By default, CONNECT destination hostnames and IPs are redacted in logs. Set `logging.log_destinations: true` only for short debug windows when you need full destination visibility.
+
+For throughput testing, you can temporarily switch the VPS and Access Node to:
+
+```yaml
+performance:
+  profile: throughput
+```
+
+This keeps the same wire protocol but uses larger local socket buffers and less frequent DATA drain calls. If it performs worse on a lossy path, return to `balanced` or test `compatibility`.
+
+Local VPS HTTP baseline test:
+
+```bash
+python3 -m http.server 18080 --bind 127.0.0.1
+curl -o /dev/null -w "local bytes:%{size_download} speed:%{speed_download} total:%{time_total}\n" \
+  http://127.0.0.1:18080/
+```
+
+CPU and TCP state checks:
+
+```bash
+top -p "$(pgrep -f 'smtp-tunnel|client.py|server.py' | paste -sd, -)"
+sudo ss -tinp | grep ':587'
+```
 
 Let's Encrypt renewal test:
 
