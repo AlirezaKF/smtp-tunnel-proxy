@@ -74,6 +74,35 @@ tunnel:
   # Recommended starting point for reverse mode throughput testing: 4.
   connections: 1
 
+  # Outbound destination connect timeout on the Exit Node.
+  connect_timeout: 10
+
+# ============================================================================
+# Metrics, Logging Privacy, and Transport Tuning - Optional
+# ============================================================================
+metrics:
+  # Reverse status logs are useful while tuning multi-session reverse mode.
+  enabled: true
+  log_interval: 30
+
+logging:
+  # false redacts CONNECT destinations in logs. Set true only for debugging.
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
+
+transport:
+  # Frame payloads remain compatible with the existing 5-byte wire protocol.
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  # 0 means leave OS default socket buffer sizes.
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
+  tcp_nodelay: true
+  tcp_keepalive: true
+  pending_buffer_limit: 1048576
+
 # ============================================================================
 # SMTP Compatibility Configuration - Optional
 # ============================================================================
