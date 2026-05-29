@@ -151,6 +151,7 @@ curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/
   --tls-verify-mode system-ca \
   --username reverse1 \
   --secret-file /root/reverse.secret \
+  --connections 4 \
   --yes
 ```
 
@@ -165,6 +166,24 @@ Test from the Access Node:
 ```bash
 curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 ```
+
+Verify that multiple reverse sessions are established from the VPS:
+
+```bash
+sudo ss -tnp | grep ':587'
+sudo journalctl -u smtp-tunnel -f
+```
+
+Stage 2 reverse mode uses `tunnel.connections` independent tunnel sessions. New SOCKS channels are assigned to the least-active reverse session. This improves aggregate throughput and concurrent flows when the network benefits from parallel streams. It does not stripe one TCP flow across multiple tunnels, so a single download or single TCP connection can still be limited by one tunnel session.
+
+Recommended starting point:
+
+```yaml
+tunnel:
+  connections: 4
+```
+
+If 4 is worse than 2 or 8 on your specific route, test and use the value that performs best.
 
 Let's Encrypt renewal test:
 
@@ -697,7 +716,7 @@ then installation completed. The `scripts/bootstrap.sh` cleanup logic should sti
 - This project does not guarantee that traffic will never be detected or blocked.
 - Python/OpenSSL TLS fingerprints remain observable.
 - Long-lived TLS over an SMTP-like port may look unusual.
-- Reverse mode is optional. Stage 1 supports one reverse tunnel session; mTLS and multi-session pooling are planned separately.
+- Reverse mode is optional. Stage 2 supports multiple reverse tunnel sessions for concurrent flows. mTLS and single-flow striping are planned separately.
 - Use this tool only in environments where you have authorization and where its use is lawful.
 
 ---
