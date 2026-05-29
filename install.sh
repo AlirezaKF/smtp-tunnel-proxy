@@ -25,6 +25,7 @@ GITHUB_RAW="${GITHUB_RAW:-https://raw.githubusercontent.com/x011/smtp-tunnel-pro
 INSTALL_DIR="${INSTALL_DIR:-/opt/smtp-tunnel}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/smtp-tunnel}"
 CERT_DIR="${CERT_DIR:-/etc/smtp-tunnel/certs}"
+REVERSE_CERT_DIR="${REVERSE_CERT_DIR:-/etc/smtp-tunnel/reverse-certs}"
 LOG_DIR="${LOG_DIR:-/var/log/smtp-tunnel}"
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/smtp-tunnel}"
@@ -38,6 +39,7 @@ TEMPLATE_FILES="config.yaml users.yaml requirements.txt smtp-tunnel.service"
 EXTRA_FILES="install.sh README.md TECHNICAL.md LICENSE"
 
 ROLE="server"
+MODE="normal"
 ROLE_SET=0
 NON_INTERACTIVE=0
 ASSUME_YES=0
@@ -64,6 +66,19 @@ SECRET_ENV=""
 CA_CERT_SOURCE=""
 EHLO_NAME=""
 FROM_PACKAGE=""
+FROM_REVERSE_PACKAGE=""
+REVERSE_CERT_MODE="existing"
+REVERSE_DOMAIN=""
+REVERSE_CERT_FILE=""
+REVERSE_KEY_FILE=""
+LETSENCRYPT_EMAIL=""
+LETSENCRYPT_CHALLENGE="http-01"
+REVERSE_ALLOWED_DIALER_IPS=""
+TLS_VERIFY_MODE="system-ca"
+REVERSE_CA_CERT_SOURCE=""
+REVERSE_FINGERPRINT=""
+EXPORT_REVERSE_PACKAGE=0
+INCLUDE_REVERSE_SECRET=0
 
 BACKUP_DIR=""
 EXISTING_INSTALL=0
@@ -82,6 +97,7 @@ Usage:
 
 Server options:
   --role server
+  --mode normal|reverse-dial  Server mode (default: normal)
   --listen-host HOST           Server listen host (default: 0.0.0.0)
   --hostname NAME              SMTP hostname and certificate hostname
   --listen-port PORT           Server listen port (default: 587)
@@ -92,6 +108,7 @@ Server options:
 
 Client options:
   --role client
+  --mode normal|reverse-listen Client mode (default: normal)
   --from-package PATH          Install client config/CA from server-generated tar.gz bundle
   --server-host HOST           Tunnel server hostname
   --server-port PORT           Tunnel server port (default: 587)
@@ -103,6 +120,22 @@ Client options:
   --secret-env NAME            Read tunnel secret from an environment variable
   --ca-cert PATH               CA cert to copy to /etc/smtp-tunnel/certs/ca.crt
   --allow-insecure-no-ca       Allow client install without ca_cert
+
+Reverse mode options:
+  --reverse-host HOST          Access Node host/domain for reverse-dial
+  --reverse-port PORT          Reverse listener/dial port (default: 587)
+  --reverse-domain DOMAIN      TLS domain for reverse-listen
+  --reverse-cert-mode MODE     existing|letsencrypt|letsencrypt-http|letsencrypt-dns|private-ca
+  --reverse-cert-file PATH     Existing reverse listener certificate/fullchain
+  --reverse-key-file PATH      Existing reverse listener private key
+  --letsencrypt-email EMAIL    Let's Encrypt account email
+  --allowed-dialer-ip IP/CIDR  Restrict Access Node listener to VPS public IP/CIDR
+  --tls-verify-mode MODE       system-ca|private-ca|fingerprint for reverse-dial
+  --reverse-ca-cert PATH       CA cert for reverse-dial private-ca verification
+  --reverse-fingerprint HEX    SHA-256 cert fingerprint for reverse-dial
+  --from-reverse-package PATH  Install VPS reverse-dial config from bundle
+  --export-reverse-package     Export VPS reverse-dial bundle from Access Node
+  --include-reverse-secret     Include reverse.secret in exported bundle
 
 Upgrade / automation:
   --non-interactive            Do not prompt; fail if required values are missing
@@ -126,6 +159,10 @@ parse_args() {
             --role)
                 ROLE="${2:-}"
                 ROLE_SET=1
+                shift 2
+                ;;
+            --mode)
+                MODE="${2:-}"
                 shift 2
                 ;;
             --hostname)
@@ -180,6 +217,71 @@ parse_args() {
             --from-package)
                 FROM_PACKAGE="${2:-}"
                 shift 2
+                ;;
+            --from-reverse-package)
+                FROM_REVERSE_PACKAGE="${2:-}"
+                shift 2
+                ;;
+            --reverse-host|--reverse-client-host)
+                SERVER_HOST="${2:-}"
+                shift 2
+                ;;
+            --reverse-port|--reverse-listen-port|--reverse-client-port)
+                SERVER_PORT="${2:-}"
+                LISTEN_PORT="${2:-}"
+                shift 2
+                ;;
+            --reverse-domain)
+                REVERSE_DOMAIN="${2:-}"
+                shift 2
+                ;;
+            --reverse-cert-mode)
+                REVERSE_CERT_MODE="${2:-}"
+                shift 2
+                ;;
+            --reverse-cert-file)
+                REVERSE_CERT_FILE="${2:-}"
+                shift 2
+                ;;
+            --reverse-key-file)
+                REVERSE_KEY_FILE="${2:-}"
+                shift 2
+                ;;
+            --letsencrypt-email)
+                LETSENCRYPT_EMAIL="${2:-}"
+                shift 2
+                ;;
+            --letsencrypt-challenge)
+                LETSENCRYPT_CHALLENGE="${2:-}"
+                shift 2
+                ;;
+            --allowed-dialer-ip|--reverse-allowed-dialer-ip)
+                if [ -n "$REVERSE_ALLOWED_DIALER_IPS" ]; then
+                    REVERSE_ALLOWED_DIALER_IPS="$REVERSE_ALLOWED_DIALER_IPS ${2:-}"
+                else
+                    REVERSE_ALLOWED_DIALER_IPS="${2:-}"
+                fi
+                shift 2
+                ;;
+            --tls-verify-mode)
+                TLS_VERIFY_MODE="${2:-}"
+                shift 2
+                ;;
+            --reverse-ca-cert)
+                REVERSE_CA_CERT_SOURCE="${2:-}"
+                shift 2
+                ;;
+            --reverse-fingerprint)
+                REVERSE_FINGERPRINT="${2:-}"
+                shift 2
+                ;;
+            --export-reverse-package)
+                EXPORT_REVERSE_PACKAGE=1
+                shift
+                ;;
+            --include-reverse-secret)
+                INCLUDE_REVERSE_SECRET=1
+                shift
                 ;;
             --ehlo-name)
                 EHLO_NAME="${2:-}"
@@ -238,6 +340,7 @@ parse_args() {
     done
 
     validate_role
+    validate_mode
 }
 
 validate_role() {
@@ -245,6 +348,22 @@ validate_role() {
         print_error "--role must be either server or client"
         exit 1
     fi
+}
+
+validate_mode() {
+    case "$MODE" in
+        normal) ;;
+        reverse-listen)
+            [ "$ROLE" = "client" ] || { print_error "--mode reverse-listen requires --role client"; exit 1; }
+            ;;
+        reverse-dial)
+            [ "$ROLE" = "server" ] || { print_error "--mode reverse-dial requires --role server"; exit 1; }
+            ;;
+        *)
+            print_error "--mode must be normal, reverse-listen, or reverse-dial"
+            exit 1
+            ;;
+    esac
 }
 
 check_root() {
@@ -448,6 +567,7 @@ prompt_install_options() {
         ROLE="${role_response:-server}"
         validate_role
     fi
+    validate_mode
 
     prompt_with_default SERVICE_NAME "Enter systemd service name" "$SERVICE_NAME"
 
@@ -456,7 +576,49 @@ prompt_install_options() {
         return
     fi
 
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-listen" ]; then
+        prompt_with_default SOCKS_HOST "Enter local SOCKS bind host" "127.0.0.1"
+        prompt_with_default SOCKS_PORT "Enter local SOCKS port" "1080"
+        prompt_with_default LISTEN_HOST "Enter reverse listen host" "0.0.0.0"
+        prompt_with_default LISTEN_PORT "Enter reverse listen port" "587"
+        prompt_if_empty REVERSE_DOMAIN "Enter public domain for reverse listener TLS certificate:"
+        prompt_with_default REVERSE_CERT_MODE "Certificate mode (existing, letsencrypt, letsencrypt-http, letsencrypt-dns, private-ca)" "$REVERSE_CERT_MODE"
+        case "$REVERSE_CERT_MODE" in
+            existing)
+                prompt_if_empty REVERSE_CERT_FILE "Enter existing reverse certificate/fullchain path:"
+                prompt_if_empty REVERSE_KEY_FILE "Enter existing reverse private key path:"
+                ;;
+            letsencrypt|letsencrypt-http|letsencrypt-dns)
+                prompt_if_empty LETSENCRYPT_EMAIL "Enter Let's Encrypt email:"
+                ;;
+        esac
+        prompt_if_empty USERNAME_VALUE "Enter reverse auth username:"
+        prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+        prompt_if_empty REVERSE_ALLOWED_DIALER_IPS "Enter VPS public IP/CIDR allowed to dial reverse listener:"
+        if confirm "Export a VPS reverse-dial bundle after install?"; then
+            EXPORT_REVERSE_PACKAGE=1
+            if confirm "Include reverse auth secret in VPS bundle?"; then
+                INCLUDE_REVERSE_SECRET=1
+            fi
+        fi
+    elif [ "$MODE" = "reverse-dial" ]; then
+        if [ -z "$FROM_REVERSE_PACKAGE" ]; then
+            prompt_if_empty SERVER_HOST "Enter Access Node reverse host/domain:"
+            prompt_with_default SERVER_PORT "Enter Access Node reverse port" "587"
+            if [ -z "$REVERSE_DOMAIN" ]; then
+                REVERSE_DOMAIN="$SERVER_HOST"
+            fi
+            prompt_with_default REVERSE_DOMAIN "Enter TLS server name/SNI" "$REVERSE_DOMAIN"
+            prompt_with_default TLS_VERIFY_MODE "TLS verification mode (system-ca, private-ca, fingerprint)" "$TLS_VERIFY_MODE"
+            if [ "$TLS_VERIFY_MODE" = "private-ca" ]; then
+                prompt_if_empty REVERSE_CA_CERT_SOURCE "Enter reverse CA cert path:"
+            elif [ "$TLS_VERIFY_MODE" = "fingerprint" ]; then
+                prompt_if_empty REVERSE_FINGERPRINT "Enter reverse certificate SHA-256 fingerprint:"
+            fi
+            prompt_if_empty USERNAME_VALUE "Enter reverse auth username:"
+            prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+        fi
+    elif [ "$ROLE" = "server" ]; then
         prompt_with_default LISTEN_HOST "Enter server listen host" "0.0.0.0"
         prompt_with_default LISTEN_PORT "Enter server listen port" "587"
         prompt_if_empty HOSTNAME_VALUE "Enter public hostname/domain for certificate and SMTP greeting:"
@@ -508,6 +670,44 @@ install_system_dependencies() {
     esac
 }
 
+install_certbot_if_needed() {
+    case "$REVERSE_CERT_MODE" in
+        letsencrypt|letsencrypt-http|letsencrypt-dns) ;;
+        *) return ;;
+    esac
+    if command -v certbot >/dev/null 2>&1; then
+        return
+    fi
+    print_step "Installing certbot for Let's Encrypt"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would install certbot"
+        return
+    fi
+    case "${OS:-unknown}" in
+        ubuntu|debian)
+            apt-get update -qq
+            apt-get install -y -qq certbot
+            ;;
+        centos|rhel|rocky|alma)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y certbot
+            else
+                yum install -y certbot
+            fi
+            ;;
+        fedora)
+            dnf install -y certbot
+            ;;
+        arch|manjaro)
+            pacman -Sy --noconfirm certbot
+            ;;
+        *)
+            print_error "certbot is required for Let's Encrypt mode; install certbot or use existing/private-ca mode"
+            exit 1
+            ;;
+    esac
+}
+
 detect_existing_install() {
     if [ -d "$INSTALL_DIR" ] || [ -d "$CONFIG_DIR" ] || [ -f "$SERVICE_DIR/${SERVICE_NAME}.service" ]; then
         EXISTING_INSTALL=1
@@ -544,6 +744,9 @@ backup_existing_install() {
 
     if [ -d "$CERT_DIR" ]; then
         cp -a "$CERT_DIR" "$BACKUP_DIR/config/certs"
+    fi
+    if [ -d "$REVERSE_CERT_DIR" ]; then
+        cp -a "$REVERSE_CERT_DIR" "$BACKUP_DIR/config/reverse-certs"
     fi
 
     if [ -d "$INSTALL_DIR" ]; then
@@ -603,10 +806,11 @@ create_directories() {
         print_info "Dry-run: would create $INSTALL_DIR, $CONFIG_DIR, $CERT_DIR, and $LOG_DIR"
         return
     fi
-    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERT_DIR" "$LOG_DIR" "$BIN_DIR"
+    mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$CERT_DIR" "$REVERSE_CERT_DIR" "$LOG_DIR" "$BIN_DIR"
     chmod 755 "$INSTALL_DIR"
     chmod 700 "$CONFIG_DIR"
     chmod 700 "$CERT_DIR"
+    chmod 700 "$REVERSE_CERT_DIR"
     chmod 755 "$LOG_DIR"
 }
 
@@ -720,7 +924,43 @@ preflight_role_values() {
     validate_port_value "$SERVER_PORT" "--server-port"
     validate_port_value "$SOCKS_PORT" "--socks-port"
 
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-listen" ]; then
+        load_secret_from_safe_source
+        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+            require_value "$REVERSE_DOMAIN" "--reverse-domain"
+            require_value "$USERNAME_VALUE" "--username"
+            [ -n "$SECRET_VALUE" ] || { print_error "reverse-listen needs --secret-file, --secret-env, or interactive secret"; exit 1; }
+            case "$REVERSE_CERT_MODE" in
+                existing)
+                    require_value "$REVERSE_CERT_FILE" "--reverse-cert-file"
+                    require_value "$REVERSE_KEY_FILE" "--reverse-key-file"
+                    ;;
+                letsencrypt|letsencrypt-http|letsencrypt-dns)
+                    require_value "$LETSENCRYPT_EMAIL" "--letsencrypt-email"
+                    ;;
+                private-ca) ;;
+                *) print_error "--reverse-cert-mode must be existing, letsencrypt, letsencrypt-http, letsencrypt-dns, or private-ca"; exit 1 ;;
+            esac
+        fi
+    elif [ "$MODE" = "reverse-dial" ]; then
+        load_secret_from_safe_source
+        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+            if [ -n "$FROM_REVERSE_PACKAGE" ]; then
+                [ -f "$FROM_REVERSE_PACKAGE" ] || { print_error "--from-reverse-package not found: $FROM_REVERSE_PACKAGE"; exit 1; }
+                return
+            fi
+            require_value "$SERVER_HOST" "--reverse-host"
+            require_value "$REVERSE_DOMAIN" "--reverse-domain"
+            require_value "$USERNAME_VALUE" "--username"
+            [ -n "$SECRET_VALUE" ] || { print_error "reverse-dial needs --secret-file, --secret-env, --from-reverse-package, or interactive secret"; exit 1; }
+            case "$TLS_VERIFY_MODE" in
+                system-ca) ;;
+                private-ca) require_value "$REVERSE_CA_CERT_SOURCE" "--reverse-ca-cert" ;;
+                fingerprint) require_value "$REVERSE_FINGERPRINT" "--reverse-fingerprint" ;;
+                *) print_error "--tls-verify-mode must be system-ca, private-ca, or fingerprint"; exit 1 ;;
+            esac
+        fi
+    elif [ "$ROLE" = "server" ]; then
         if [ "$NON_INTERACTIVE" -eq 1 ] && [ -z "$HOSTNAME_VALUE" ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$MIGRATE_CONFIG" -eq 1 ]; }; then
             require_value "$HOSTNAME_VALUE" "--hostname"
         fi
@@ -743,6 +983,360 @@ preflight_role_values() {
             fi
         fi
     fi
+}
+
+write_reverse_secret_file() {
+    if [ -z "$SECRET_VALUE" ]; then
+        return
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would write /etc/smtp-tunnel/reverse.secret"
+        return
+    fi
+    printf '%s\n' "$SECRET_VALUE" > "$CONFIG_DIR/reverse.secret"
+    chmod 600 "$CONFIG_DIR/reverse.secret"
+}
+
+install_letsencrypt_renew_hook() {
+    if [ "$REVERSE_CERT_MODE" != "letsencrypt" ] && [ "$REVERSE_CERT_MODE" != "letsencrypt-http" ] && [ "$REVERSE_CERT_MODE" != "letsencrypt-dns" ]; then
+        return
+    fi
+    print_step "Installing Let's Encrypt renewal deploy hook"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would install certbot deploy hook to restart $SERVICE_NAME"
+        return
+    fi
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/smtp-tunnel-restart.sh << EOF
+#!/bin/bash
+systemctl try-restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+EOF
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/smtp-tunnel-restart.sh
+}
+
+provision_reverse_certificate() {
+    if [ "$MODE" != "reverse-listen" ]; then
+        return
+    fi
+
+    prompt_if_empty REVERSE_DOMAIN "Enter public domain for reverse listener certificate:"
+    if [ "$REVERSE_CERT_MODE" = "letsencrypt" ]; then
+        if [ "$LETSENCRYPT_CHALLENGE" = "dns-01" ] || [ "$LETSENCRYPT_CHALLENGE" = "manual" ]; then
+            REVERSE_CERT_MODE="letsencrypt-dns"
+        else
+            REVERSE_CERT_MODE="letsencrypt-http"
+        fi
+    fi
+
+    case "$REVERSE_CERT_MODE" in
+        existing)
+            prompt_if_empty REVERSE_CERT_FILE "Enter existing reverse certificate/fullchain path:"
+            prompt_if_empty REVERSE_KEY_FILE "Enter existing reverse private key path:"
+            [ -f "$REVERSE_CERT_FILE" ] || { print_error "Reverse cert file not found: $REVERSE_CERT_FILE"; exit 1; }
+            [ -f "$REVERSE_KEY_FILE" ] || { print_error "Reverse key file not found: $REVERSE_KEY_FILE"; exit 1; }
+            ;;
+        letsencrypt|letsencrypt-http)
+            prompt_if_empty LETSENCRYPT_EMAIL "Enter Let's Encrypt email:"
+            print_warn "HTTP-01 requires $REVERSE_DOMAIN to point to this Access Node, public TCP/80 reachable, and no service occupying port 80 during issuance."
+            if ! confirm "Continue with Let's Encrypt HTTP-01 issuance?"; then
+                print_error "Let's Encrypt HTTP-01 cancelled"
+                exit 1
+            fi
+            install_certbot_if_needed
+            if [ "$DRY_RUN" -eq 1 ]; then
+                print_info "Dry-run: would run certbot certonly --standalone for $REVERSE_DOMAIN"
+            else
+                certbot certonly --standalone -d "$REVERSE_DOMAIN" --email "$LETSENCRYPT_EMAIL" --agree-tos --non-interactive
+            fi
+            REVERSE_CERT_FILE="/etc/letsencrypt/live/$REVERSE_DOMAIN/fullchain.pem"
+            REVERSE_KEY_FILE="/etc/letsencrypt/live/$REVERSE_DOMAIN/privkey.pem"
+            install_letsencrypt_renew_hook
+            ;;
+        letsencrypt-dns)
+            prompt_if_empty LETSENCRYPT_EMAIL "Enter Let's Encrypt email:"
+            print_warn "DNS-01/manual requires control of DNS for $REVERSE_DOMAIN. Certbot will ask you to create TXT records."
+            install_certbot_if_needed
+            if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                print_error "Let's Encrypt DNS-01 manual mode is interactive. Use existing/private-ca mode or run without --non-interactive."
+                exit 1
+            fi
+            if [ "$DRY_RUN" -eq 1 ]; then
+                print_info "Dry-run: would run certbot certonly --manual --preferred-challenges dns for $REVERSE_DOMAIN"
+            else
+                certbot certonly --manual --preferred-challenges dns -d "$REVERSE_DOMAIN" --email "$LETSENCRYPT_EMAIL" --agree-tos
+            fi
+            REVERSE_CERT_FILE="/etc/letsencrypt/live/$REVERSE_DOMAIN/fullchain.pem"
+            REVERSE_KEY_FILE="/etc/letsencrypt/live/$REVERSE_DOMAIN/privkey.pem"
+            install_letsencrypt_renew_hook
+            ;;
+        private-ca)
+            REVERSE_CERT_FILE="$REVERSE_CERT_DIR/server.crt"
+            REVERSE_KEY_FILE="$REVERSE_CERT_DIR/server.key"
+            if [ -f "$REVERSE_CERT_FILE" ] && [ -f "$REVERSE_KEY_FILE" ] && [ -f "$REVERSE_CERT_DIR/ca.crt" ]; then
+                print_info "Existing reverse private CA certificate preserved"
+                return
+            fi
+            print_step "Generating reverse private CA certificate"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                print_info "Dry-run: would generate reverse private CA certs in $REVERSE_CERT_DIR"
+            else
+                (cd "$INSTALL_DIR" && "$PYTHON_BIN" generate_certs.py --hostname "$REVERSE_DOMAIN" --output-dir "$REVERSE_CERT_DIR")
+            fi
+            ;;
+        *)
+            print_error "--reverse-cert-mode must be existing, letsencrypt, letsencrypt-http, letsencrypt-dns, or private-ca"
+            exit 1
+            ;;
+    esac
+}
+
+write_yaml_list_from_words() {
+    local words="$1"
+    if [ -z "$words" ]; then
+        echo "      []"
+        return
+    fi
+    for item in $words; do
+        echo "      - $item"
+    done
+}
+
+write_reverse_listen_config() {
+    local config_path="$CONFIG_DIR/config.yaml"
+    if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        print_info "Existing config preserved: $config_path"
+        return
+    fi
+    if [ -f "$config_path" ] && { [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+        if ! confirm "Overwrite $config_path with reverse-listen config? Backup already exists."; then
+            print_info "Existing config preserved"
+            return
+        fi
+    fi
+
+    prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+    write_reverse_secret_file
+    provision_reverse_certificate
+
+    print_step "Writing reverse-listen config"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would write $config_path"
+        return
+    fi
+
+    cat > "$config_path" << EOF
+# SMTP Tunnel Proxy Configuration
+# Generated by install.sh for Access Node reverse-listen mode
+
+client:
+  mode: reverse-listen
+  socks_host: "$SOCKS_HOST"
+  socks_port: $SOCKS_PORT
+  reverse:
+    listen_host: "$LISTEN_HOST"
+    listen_port: $LISTEN_PORT
+    auth_username: "$USERNAME_VALUE"
+    auth_secret_file: "$CONFIG_DIR/reverse.secret"
+    allowed_dialer_ips:
+EOF
+    write_yaml_list_from_words "$REVERSE_ALLOWED_DIALER_IPS" >> "$config_path"
+    cat >> "$config_path" << EOF
+    tls:
+      cert_mode: "$([ "$REVERSE_CERT_MODE" = "letsencrypt" ] || [ "$REVERSE_CERT_MODE" = "letsencrypt-http" ] || [ "$REVERSE_CERT_MODE" = "letsencrypt-dns" ] && echo "letsencrypt" || echo "$REVERSE_CERT_MODE")"
+      domain: "$REVERSE_DOMAIN"
+      cert_file: "$REVERSE_CERT_FILE"
+      key_file: "$REVERSE_KEY_FILE"
+      letsencrypt_email: "$LETSENCRYPT_EMAIL"
+      letsencrypt_challenge: "$LETSENCRYPT_CHALLENGE"
+      auto_renew: true
+    mtls:
+      enabled: false
+
+tunnel:
+  connections: 1
+  keepalive_interval: 45
+  keepalive_timeout: 120
+  reconnect_initial_delay: 2
+  reconnect_max_delay: 60
+  reconnect_jitter: 0.35
+
+smtp:
+  ehlo_name: "${EHLO_NAME:-$REVERSE_DOMAIN}"
+EOF
+    chmod 600 "$config_path"
+}
+
+import_reverse_package() {
+    local package_path="$1"
+    local config_path="$CONFIG_DIR/config.yaml"
+    local tmpdir package_config package_secret package_ca
+    [ -f "$package_path" ] || { print_error "Reverse package not found: $package_path"; exit 1; }
+    if ! tar -tzf "$package_path" >/dev/null 2>&1; then
+        print_error "Reverse package is not a readable tar.gz archive: $package_path"
+        exit 1
+    fi
+    tmpdir="$(mktemp -d /tmp/smtp-tunnel-reverse-package.XXXXXX)"
+    tar -xzf "$package_path" -C "$tmpdir"
+    package_config="$(find "$tmpdir" -type f -name config.yaml | head -n 1)"
+    package_secret="$(find "$tmpdir" -type f -name reverse.secret | head -n 1)"
+    package_ca="$(find "$tmpdir" -type f -name ca.crt | head -n 1)"
+    [ -n "$package_config" ] || { rm -rf "$tmpdir"; print_error "Reverse package missing config.yaml"; exit 1; }
+    cp -a "$package_config" "$config_path"
+    chmod 600 "$config_path"
+    if [ -n "$package_secret" ]; then
+        cp -a "$package_secret" "$CONFIG_DIR/reverse.secret"
+        chmod 600 "$CONFIG_DIR/reverse.secret"
+    else
+        prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+        write_reverse_secret_file
+        "$PYTHON_BIN" - "$config_path" "$CONFIG_DIR/reverse.secret" << 'PY'
+import sys
+import yaml
+config_path, secret_path = sys.argv[1:3]
+with open(config_path, 'r') as f:
+    data = yaml.safe_load(f) or {}
+data.setdefault('server', {}).setdefault('reverse', {})['auth_secret_file'] = secret_path
+with open(config_path, 'w') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    fi
+    if [ -n "$package_ca" ]; then
+        cp -a "$package_ca" "$CERT_DIR/reverse-ca.crt"
+        chmod 644 "$CERT_DIR/reverse-ca.crt"
+    fi
+    rm -rf "$tmpdir"
+    print_info "Reverse-dial config installed from package"
+}
+
+write_reverse_dial_config() {
+    local config_path="$CONFIG_DIR/config.yaml"
+    local ca_path=""
+    if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        print_info "Existing config preserved: $config_path"
+        return
+    fi
+    if [ -f "$config_path" ] && { [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+        if ! confirm "Overwrite $config_path with reverse-dial config? Backup already exists."; then
+            print_info "Existing config preserved"
+            return
+        fi
+    fi
+    if [ -n "$FROM_REVERSE_PACKAGE" ]; then
+        import_reverse_package "$FROM_REVERSE_PACKAGE"
+        return
+    fi
+
+    prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+    write_reverse_secret_file
+    if [ "$TLS_VERIFY_MODE" = "private-ca" ]; then
+        [ -f "$REVERSE_CA_CERT_SOURCE" ] || { print_error "Reverse CA cert not found: $REVERSE_CA_CERT_SOURCE"; exit 1; }
+        ca_path="$CERT_DIR/reverse-ca.crt"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            print_info "Dry-run: would copy $REVERSE_CA_CERT_SOURCE -> $ca_path"
+        else
+            cp -a "$REVERSE_CA_CERT_SOURCE" "$ca_path"
+            chmod 644 "$ca_path"
+        fi
+    fi
+
+    print_step "Writing reverse-dial config"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would write $config_path"
+        return
+    fi
+    cat > "$config_path" << EOF
+# SMTP Tunnel Proxy Configuration
+# Generated by install.sh for Exit Node reverse-dial mode
+
+server:
+  mode: reverse-dial
+  reverse:
+    access_host: "$SERVER_HOST"
+    access_port: $SERVER_PORT
+    tls_server_name: "${REVERSE_DOMAIN:-$SERVER_HOST}"
+    auth_username: "$USERNAME_VALUE"
+    auth_secret_file: "$CONFIG_DIR/reverse.secret"
+    tls:
+      verify_mode: "$TLS_VERIFY_MODE"
+      ca_cert: "${ca_path:-$REVERSE_CA_CERT_SOURCE}"
+      cert_fingerprint_sha256: "$REVERSE_FINGERPRINT"
+    mtls:
+      enabled: false
+
+tunnel:
+  connections: 1
+  keepalive_interval: 45
+  keepalive_timeout: 120
+  reconnect_initial_delay: 2
+  reconnect_max_delay: 60
+  reconnect_jitter: 0.35
+
+smtp:
+  ehlo_name: "${EHLO_NAME:-$SERVER_HOST}"
+EOF
+    chmod 600 "$config_path"
+}
+
+export_reverse_dial_bundle() {
+    if [ "$MODE" != "reverse-listen" ] || [ "$EXPORT_REVERSE_PACKAGE" -ne 1 ]; then
+        return
+    fi
+    local bundle_dir bundle_path ca_line secret_line
+    bundle_dir="$(mktemp -d /tmp/smtp-tunnel-reverse-bundle.XXXXXX)"
+    bundle_path="/root/smtp-tunnel-reverse-dial-${USERNAME_VALUE:-vps}.tar.gz"
+    ca_line=""
+    secret_line='    # auth_secret_file: "/etc/smtp-tunnel/reverse.secret"'
+    if [ "$REVERSE_CERT_MODE" = "private-ca" ] && [ -f "$REVERSE_CERT_DIR/ca.crt" ]; then
+        cp -a "$REVERSE_CERT_DIR/ca.crt" "$bundle_dir/ca.crt"
+        ca_line='      ca_cert: "/etc/smtp-tunnel/certs/reverse-ca.crt"'
+    elif [ "$REVERSE_CERT_MODE" = "private-ca" ] && [ "$DRY_RUN" -eq 1 ]; then
+        ca_line='      ca_cert: "/etc/smtp-tunnel/certs/reverse-ca.crt"'
+    fi
+    if [ "$INCLUDE_REVERSE_SECRET" -eq 1 ] && [ -f "$CONFIG_DIR/reverse.secret" ]; then
+        cp -a "$CONFIG_DIR/reverse.secret" "$bundle_dir/reverse.secret"
+        secret_line='    auth_secret_file: "/etc/smtp-tunnel/reverse.secret"'
+    elif [ "$INCLUDE_REVERSE_SECRET" -eq 1 ] && [ "$DRY_RUN" -eq 1 ]; then
+        secret_line='    auth_secret_file: "/etc/smtp-tunnel/reverse.secret"'
+    fi
+    cat > "$bundle_dir/config.yaml" << EOF
+server:
+  mode: reverse-dial
+  reverse:
+    access_host: "$REVERSE_DOMAIN"
+    access_port: $LISTEN_PORT
+    tls_server_name: "$REVERSE_DOMAIN"
+    auth_username: "$USERNAME_VALUE"
+$secret_line
+    tls:
+      verify_mode: "$([ "$REVERSE_CERT_MODE" = "private-ca" ] && echo "private-ca" || echo "system-ca")"
+$ca_line
+      cert_fingerprint_sha256: ""
+    mtls:
+      enabled: false
+
+tunnel:
+  connections: 1
+  keepalive_interval: 45
+  keepalive_timeout: 120
+  reconnect_initial_delay: 2
+  reconnect_max_delay: 60
+  reconnect_jitter: 0.35
+EOF
+    cat > "$bundle_dir/INSTALL-REVERSE-DIAL.txt" << EOF
+Install on the VPS Exit Node:
+
+sudo bash ./install.sh --role server --mode reverse-dial --from-reverse-package /path/to/$(basename "$bundle_path")
+
+If reverse.secret is not included, enter the reverse auth secret during install.
+EOF
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would create reverse-dial bundle at $bundle_path"
+    else
+        tar -czf "$bundle_path" -C "$bundle_dir" .
+        chmod 600 "$bundle_path"
+        print_info "Reverse-dial VPS bundle created: $bundle_path"
+    fi
+    rm -rf "$bundle_dir"
 }
 
 write_server_config() {
@@ -1116,7 +1710,13 @@ write_systemd_service() {
     local exec_line=""
     local description=""
 
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-dial" ]; then
+        description="SMTP Tunnel Reverse Dialer"
+        exec_line="$PYTHON_BIN $INSTALL_DIR/server.py -c $CONFIG_DIR/config.yaml"
+    elif [ "$MODE" = "reverse-listen" ]; then
+        description="SMTP Tunnel Reverse Access Node"
+        exec_line="$PYTHON_BIN $INSTALL_DIR/client.py -c $CONFIG_DIR/config.yaml"
+    elif [ "$ROLE" = "server" ]; then
         description="SMTP Tunnel Server"
         exec_line="$PYTHON_BIN $INSTALL_DIR/server.py -c $CONFIG_DIR/config.yaml"
     else
@@ -1204,7 +1804,16 @@ role_preflight_after_config() {
 
     warn_if_process_running
 
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-listen" ]; then
+        if ! port_available "0.0.0.0" "$LISTEN_PORT"; then
+            print_warn "Reverse listen port $LISTEN_PORT appears to be in use"
+        fi
+        if [ -z "$REVERSE_ALLOWED_DIALER_IPS" ]; then
+            print_warn "No reverse allowed dialer IP configured; restrict the listener with firewall rules"
+        fi
+    elif [ "$MODE" = "reverse-dial" ]; then
+        :
+    elif [ "$ROLE" = "server" ]; then
         if ! port_available "0.0.0.0" "$LISTEN_PORT"; then
             print_warn "Server listen port $LISTEN_PORT appears to be in use. This is expected during some upgrades if the current service is still running."
         fi
@@ -1222,12 +1831,21 @@ role_preflight_after_config() {
 }
 
 open_firewall_server() {
-    if [ "$ROLE" != "server" ] || [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return
+    fi
+    if [ "$ROLE" != "server" ] && [ "$MODE" != "reverse-listen" ]; then
         return
     fi
     print_step "Checking firewall helper"
     if command -v ufw >/dev/null 2>&1; then
-        ufw allow "$LISTEN_PORT/tcp" >/dev/null 2>&1 || print_warn "Could not configure ufw"
+        if [ "$MODE" = "reverse-listen" ] && [ -n "$REVERSE_ALLOWED_DIALER_IPS" ]; then
+            for ip in $REVERSE_ALLOWED_DIALER_IPS; do
+                ufw allow from "$ip" to any port "$LISTEN_PORT" proto tcp >/dev/null 2>&1 || print_warn "Could not configure ufw for $ip"
+            done
+        else
+            ufw allow "$LISTEN_PORT/tcp" >/dev/null 2>&1 || print_warn "Could not configure ufw"
+        fi
     elif command -v firewall-cmd >/dev/null 2>&1; then
         firewall-cmd --permanent --add-port="$LISTEN_PORT/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || print_warn "Could not configure firewalld"
     else
@@ -1262,6 +1880,7 @@ print_summary() {
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo "Role: $ROLE"
+    echo "Mode: $MODE"
     echo "Service: $SERVICE_NAME"
     echo "Install dir: $INSTALL_DIR"
     echo "Config dir: $CONFIG_DIR"
@@ -1275,7 +1894,18 @@ print_summary() {
     echo "  sudo systemctl enable $SERVICE_NAME"
     echo "  sudo systemctl restart $SERVICE_NAME"
     echo "  sudo journalctl -u $SERVICE_NAME -f"
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-listen" ]; then
+        echo "  curl -x socks5h://$SOCKS_HOST:$SOCKS_PORT https://ifconfig.me"
+        echo "  sudo journalctl -u $SERVICE_NAME -f"
+        if [ -n "$REVERSE_ALLOWED_DIALER_IPS" ]; then
+            echo "  sudo ufw allow from $REVERSE_ALLOWED_DIALER_IPS to any port $LISTEN_PORT proto tcp"
+        fi
+        if [ "$REVERSE_CERT_MODE" = "letsencrypt-http" ] || [ "$REVERSE_CERT_MODE" = "letsencrypt-dns" ]; then
+            echo "  sudo certbot renew --dry-run"
+        fi
+    elif [ "$MODE" = "reverse-dial" ]; then
+        echo "  sudo journalctl -u $SERVICE_NAME -f"
+    elif [ "$ROLE" = "server" ]; then
         echo "  sudo smtp-tunnel-adduser alice"
         echo "  sudo systemctl restart $SERVICE_NAME"
     else
@@ -1315,7 +1945,12 @@ main() {
     install_application_files
     install_python_packages
 
-    if [ "$ROLE" = "server" ]; then
+    if [ "$MODE" = "reverse-listen" ]; then
+        write_reverse_listen_config
+        export_reverse_dial_bundle
+    elif [ "$MODE" = "reverse-dial" ]; then
+        write_reverse_dial_config
+    elif [ "$ROLE" = "server" ]; then
         write_server_config
         ensure_users_file
         generate_server_certs
