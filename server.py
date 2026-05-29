@@ -493,11 +493,13 @@ class ReverseExitSession:
         writer: asyncio.StreamWriter,
         reverse_config: ReverseDialConfig,
         tunnel_config: TunnelConfig = None,
+        session_id: int = 1,
     ):
         self.reader = reader
         self.writer = writer
         self.reverse_config = reverse_config
         self.tunnel_config = tunnel_config or TunnelConfig()
+        self.session_id = session_id
         self.channels: Dict[int, Channel] = {}
         self.channel_tasks: Dict[int, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
@@ -520,7 +522,7 @@ class ReverseExitSession:
                         break
                     continue
                 except FrameProtocolError as e:
-                    logger.warning(f"Malformed reverse tunnel frame: {e}")
+                    logger.warning(f"[reverse session {self.session_id}] Malformed reverse tunnel frame: {e}")
                     break
         finally:
             self.connected = False
@@ -541,7 +543,7 @@ class ReverseExitSession:
     async def _handle_connect(self, channel_id: int, payload: bytes):
         try:
             host, port = parse_connect_payload(payload)
-            logger.info(f"[reverse] CONNECT ch={channel_id} -> {host}:{port}")
+            logger.info(f"[reverse session {self.session_id}] CONNECT ch={channel_id} -> {host}:{port}")
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
@@ -559,10 +561,10 @@ class ReverseExitSession:
                 await self._send_frame(FRAME_CONNECT_OK, channel_id)
                 self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
             except Exception as e:
-                logger.warning(f"[reverse] Connect failed ch={channel_id}: {e}")
+                logger.warning(f"[reverse session {self.session_id}] Connect failed ch={channel_id}: {e}")
                 await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
         except FrameProtocolError as e:
-            logger.warning(f"[reverse] Invalid CONNECT ch={channel_id}: {e}")
+            logger.warning(f"[reverse session {self.session_id}] Invalid CONNECT ch={channel_id}: {e}")
             await self._send_frame(FRAME_CONNECT_FAIL, channel_id)
 
     async def _handle_data(self, channel_id: int, payload: bytes):
@@ -574,7 +576,7 @@ class ReverseExitSession:
             except Exception:
                 await self._close_channel(channel)
         else:
-            logger.debug(f"[reverse] Dropping DATA for unknown ch={channel_id}")
+            logger.debug(f"[reverse session {self.session_id}] Dropping DATA for unknown ch={channel_id}")
 
     async def _handle_close(self, channel_id: int):
         channel = self.channels.get(channel_id)
@@ -589,7 +591,7 @@ class ReverseExitSession:
                     break
                 await self._send_frame(FRAME_DATA, channel.channel_id, data)
         except Exception as e:
-            logger.debug(f"[reverse] Channel reader error: {e}")
+            logger.debug(f"[reverse session {self.session_id}] Channel reader error: {e}")
         finally:
             self.channel_tasks.pop(channel.channel_id, None)
             if channel.connected:
@@ -604,7 +606,7 @@ class ReverseExitSession:
                 self.writer.write(encode_frame(frame_type, channel_id, payload))
                 await self.writer.drain()
         except FrameProtocolError as e:
-            logger.error(f"[reverse] Refusing malformed frame: {e}")
+            logger.error(f"[reverse session {self.session_id}] Refusing malformed frame: {e}")
         except (ConnectionResetError, BrokenPipeError, OSError):
             self.connected = False
 
@@ -619,7 +621,7 @@ class ReverseExitSession:
             except Exception:
                 pass
         self.channels.pop(channel.channel_id, None)
-        logger.debug(f"[reverse] Closed ch={channel.channel_id}")
+        logger.debug(f"[reverse session {self.session_id}] Closed ch={channel.channel_id}")
 
     async def _cleanup(self):
         for channel in list(self.channels.values()):
@@ -752,8 +754,11 @@ class ReverseDialer:
             return False
         return True
 
-    async def connect_once(self):
-        logger.info(f"Reverse dialing {self.reverse_config.access_host}:{self.reverse_config.access_port}")
+    async def connect_once(self, session_id: int):
+        logger.info(
+            f"Reverse dial session {session_id} connecting to "
+            f"{self.reverse_config.access_host}:{self.reverse_config.access_port}"
+        )
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(self.reverse_config.access_host, self.reverse_config.access_port),
             timeout=30.0,
@@ -761,8 +766,8 @@ class ReverseDialer:
         try:
             if not await self._smtp_handshake(reader, writer):
                 raise ConnectionError("reverse SMTP/TLS/auth handshake failed")
-            logger.info("Reverse tunnel established")
-            session = ReverseExitSession(reader, writer, self.reverse_config, self.tunnel_config)
+            logger.info(f"Reverse dial session {session_id} authenticated")
+            session = ReverseExitSession(reader, writer, self.reverse_config, self.tunnel_config, session_id=session_id)
             await session.run()
         finally:
             try:
@@ -771,7 +776,7 @@ class ReverseDialer:
             except Exception:
                 pass
 
-    async def run_forever(self):
+    async def run_session_forever(self, session_id: int):
         initial = max(0.1, float(self.tunnel_config.reconnect_initial_delay or 2.0))
         max_delay = max(initial, float(self.tunnel_config.reconnect_max_delay or 30.0))
         jitter = max(0.0, float(self.tunnel_config.reconnect_jitter or 0.0))
@@ -779,19 +784,37 @@ class ReverseDialer:
 
         while True:
             try:
-                await self.connect_once()
+                await self.connect_once(session_id)
                 delay = initial
-                logger.warning("Reverse tunnel disconnected")
+                logger.warning(f"Reverse dial session {session_id} disconnected")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning(f"Reverse dial failed: {e}")
+                logger.warning(f"Reverse dial session {session_id} failed: {e}")
 
             spread = delay * jitter
             sleep_for = max(0.0, delay + random.uniform(-spread, spread))
-            logger.info(f"Reverse reconnect in {sleep_for:.1f}s")
+            logger.info(f"Reverse dial session {session_id} reconnect in {sleep_for:.1f}s")
             await asyncio.sleep(sleep_for)
             delay = min(delay * 2, max_delay)
+
+    async def run_forever(self):
+        connections = max(1, int(self.tunnel_config.connections or 1))
+        logger.info(f"Reverse dial configured sessions: {connections}")
+        tasks = [
+            asyncio.create_task(self.run_session_forever(session_id))
+            for session_id in range(1, connections + 1)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
 
 def build_server_settings(config_data: dict, args) -> Tuple[ServerConfig, TunnelConfig, str]:
