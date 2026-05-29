@@ -116,10 +116,10 @@ For reverse mode, the Iran-side Access Node must also have an inbound TCP port r
 Iran-side Access Node with Let's Encrypt HTTP-01:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/scripts/bootstrap.sh | sudo bash -s -- \
   --role client \
   --mode reverse-listen \
-  --repo GITHUB_USER/REPO_NAME \
+  --repo AlirezaKF/smtp-tunnel-proxy \
   --ref main \
   --socks-host 127.0.0.1 \
   --socks-port 1080 \
@@ -131,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/
   --allowed-dialer-ip VPS_PUBLIC_IP \
   --username reverse1 \
   --secret-file /root/reverse.secret \
-  --export-reverse-package \
+  --performance-profile throughput \
   --yes
 ```
 
@@ -140,10 +140,10 @@ For HTTP-01, `ACCESS_DOMAIN` must resolve to the Iran-side Access Node, public T
 VPS Exit Node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/bootstrap.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/scripts/bootstrap.sh | sudo bash -s -- \
   --role server \
   --mode reverse-dial \
-  --repo GITHUB_USER/REPO_NAME \
+  --repo AlirezaKF/smtp-tunnel-proxy \
   --ref main \
   --reverse-host ACCESS_DOMAIN \
   --reverse-port 587 \
@@ -152,6 +152,7 @@ curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/
   --username reverse1 \
   --secret-file /root/reverse.secret \
   --connections 4 \
+  --performance-profile throughput \
   --yes
 ```
 
