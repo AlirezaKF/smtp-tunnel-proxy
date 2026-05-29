@@ -132,11 +132,12 @@ class TunnelClient:
         self.connect_results: Dict[int, bool] = {}
 
         self.write_lock = asyncio.Lock()
-        self.pending_drain_bytes = 0
-        self.last_drain_at = time.monotonic()
+        self.drain_state: Dict[int, Tuple[int, float]] = {}
+        self.drain_tasks: Dict[int, asyncio.Task] = {}
         self.keepalive_ack_event = asyncio.Event()
         self.session_id = 0
         self.session_pool = None
+        self.session_stats = None
 
     async def connect(self) -> bool:
         """Connect and do SMTP handshake, then switch to binary mode."""
@@ -289,17 +290,46 @@ class TunnelClient:
         if not is_data:
             await writer.drain()
             return
-        self.pending_drain_bytes += byte_count
+
+        key = id(writer)
+        pending_bytes, last_drain_at = self.drain_state.get(key, (0, time.monotonic()))
+        pending_bytes += byte_count
         interval = self.transport_config.drain_interval_ms / 1000.0
         now = time.monotonic()
+        transport = getattr(writer, 'transport', None)
+        write_buffer_size = transport.get_write_buffer_size() if transport else 0
         if (
-            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            pending_bytes >= self.transport_config.drain_bytes
             or interval <= 0
-            or now - self.last_drain_at >= interval
+            or now - last_drain_at >= interval
+            or write_buffer_size >= self.transport_config.pending_buffer_limit
         ):
+            task = self.drain_tasks.pop(key, None)
+            if task:
+                task.cancel()
             await writer.drain()
-            self.pending_drain_bytes = 0
-            self.last_drain_at = now
+            if transport and transport.get_write_buffer_size() >= self.transport_config.pending_buffer_limit:
+                raise BufferError("writer buffer limit exceeded")
+            self.drain_state[key] = (0, now)
+        else:
+            self.drain_state[key] = (pending_bytes, last_drain_at)
+            if key not in self.drain_tasks:
+                self.drain_tasks[key] = asyncio.create_task(self._delayed_drain(writer, key, interval))
+
+    async def _delayed_drain(self, writer: asyncio.StreamWriter, key: int, interval: float):
+        try:
+            await asyncio.sleep(interval)
+            pending = self.drain_state.get(key, (0, 0.0))[0]
+            if pending <= 0 or writer.is_closing():
+                return
+            await writer.drain()
+            self.drain_state[key] = (0, time.monotonic())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.connected = False
+        finally:
+            self.drain_tasks.pop(key, None)
 
     async def start_receiver(self):
         """Start background task to receive frames from server."""
@@ -317,12 +347,13 @@ class TunnelClient:
                 )
                 if not chunk:
                     break
-                if self.session_pool:
-                    await self.session_pool.record_read(self.session_id, len(chunk))
+                if self.session_stats:
+                    self.session_stats.bytes_in += len(chunk)
+                    self.session_stats.last_read = time.time()
                 frame_buffer.append(chunk)
 
-                for frame in frame_buffer.get_frames():
-                    await self._handle_frame(frame.frame_type, frame.channel_id, frame.payload)
+                for frame_type, channel_id, payload in frame_buffer.iter_frames():
+                    await self._handle_frame(frame_type, channel_id, payload)
 
             except asyncio.TimeoutError:
                 continue
@@ -429,8 +460,9 @@ class TunnelClient:
             try:
                 frame = encode_frame(frame_type, channel_id, payload)
                 self.writer.write(frame)
-                if self.session_pool:
-                    await self.session_pool.record_write(self.session_id, len(frame))
+                if self.session_stats:
+                    self.session_stats.bytes_out += len(frame)
+                    self.session_stats.last_write = time.time()
                 await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
                 return True
             except FrameProtocolError as e:
@@ -552,6 +584,11 @@ class TunnelClient:
             pass
 
         self.channels.pop(channel.channel_id, None)
+        if channel.writer:
+            task = self.drain_tasks.pop(id(channel.writer), None)
+            if task:
+                task.cancel()
+            self.drain_state.pop(id(channel.writer), None)
         self.opening_channels.discard(channel.channel_id)
         self.pending_channel_data.pop(channel.channel_id, None)
         self.pending_close_channels.discard(channel.channel_id)
@@ -575,6 +612,10 @@ class TunnelClient:
         self.opening_channels.clear()
         self.pending_channel_data.clear()
         self.pending_close_channels.clear()
+        for task in self.drain_tasks.values():
+            task.cancel()
+        self.drain_tasks.clear()
+        self.drain_state.clear()
 
 
 # ============================================================================
@@ -629,6 +670,7 @@ class ReverseSessionPool:
                 last_write=now,
                 connected_since=now,
             )
+            tunnel.session_stats = self.stats[session_id]
             if self.logging_config.log_session_events:
                 logger.info(f"Reverse session {session_id} authenticated; active sessions={len(self.sessions)}")
             return session_id
@@ -1017,7 +1059,13 @@ class ReverseAccessListener:
             logger.info(f"Reverse tunnel session ended: {peer_str}")
 
     async def start(self):
-        socks = SOCKS5Server(self.session_pool, self.socks_host, self.socks_port, self.logging_config)
+        socks = SOCKS5Server(
+            self.session_pool,
+            self.socks_host,
+            self.socks_port,
+            self.logging_config,
+            self.transport_config,
+        )
         socks_server = await asyncio.start_server(
             socks.handle_client,
             socks.host,
@@ -1088,12 +1136,14 @@ class SOCKS5Server:
         host: str = '127.0.0.1',
         port: int = 1080,
         logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
     ):
         self.tunnel = tunnel
         self.host = host
         self.port = port
         self.read_timeout = 30.0
         self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or getattr(tunnel, 'transport_config', TransportConfig())
 
     async def _read_exact(self, reader: asyncio.StreamReader, size: int) -> bytes:
         return await asyncio.wait_for(reader.readexactly(size), timeout=self.read_timeout)
@@ -1206,7 +1256,7 @@ class SOCKS5Server:
         """Forward data from SOCKS client to tunnel."""
         try:
             while channel.connected and self.tunnel.connected:
-                data = await channel.reader.read(32768)
+                data = await channel.reader.read(self.transport_config.read_chunk_size)
                 if data:
                     await self.tunnel.send_data(channel.channel_id, data)
                 else:
@@ -1279,7 +1329,7 @@ async def run_client(
         keepalive_task = asyncio.create_task(tunnel.keepalive_loop())
 
         # Start SOCKS server
-        socks = SOCKS5Server(tunnel, config.socks_host, config.socks_port, logging_config)
+        socks = SOCKS5Server(tunnel, config.socks_host, config.socks_port, logging_config, transport_config)
 
         try:
             # Create SOCKS server but don't block on it
