@@ -128,8 +128,8 @@ class TunnelSession:
         self.channels: Dict[int, Channel] = {}
         self.channel_tasks: Dict[int, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
-        self.pending_drain_bytes = 0
-        self.last_drain_at = time.monotonic()
+        self.drain_state: Dict[int, Tuple[int, float]] = {}
+        self.drain_tasks: Dict[int, asyncio.Task] = {}
         self.keepalive_ack_event = asyncio.Event()
 
         # User info (set after authentication)
@@ -318,8 +318,8 @@ class TunnelSession:
 
             try:
                 frame_buffer.append(chunk)
-                for frame in frame_buffer.get_frames():
-                    await self._handle_frame(frame.frame_type, frame.channel_id, frame.payload)
+                for frame_type, channel_id, payload in frame_buffer.iter_frames():
+                    await self._handle_frame(frame_type, channel_id, payload)
             except FrameProtocolError as e:
                 self._log(logging.WARNING, f"Malformed tunnel frame: {e}")
                 break
@@ -349,6 +349,8 @@ class TunnelSession:
                     asyncio.open_connection(host, port),
                     timeout=self.tunnel_config.connect_timeout
                 )
+                if os.name != 'nt':
+                    apply_socket_options(writer, self.transport_config)
 
                 channel = Channel(
                     channel_id=channel_id,
@@ -435,17 +437,45 @@ class TunnelSession:
         if not is_data:
             await writer.drain()
             return
-        self.pending_drain_bytes += byte_count
+        key = id(writer)
+        pending_bytes, last_drain_at = self.drain_state.get(key, (0, time.monotonic()))
+        pending_bytes += byte_count
         interval = self.transport_config.drain_interval_ms / 1000.0
         now = time.monotonic()
+        transport = getattr(writer, 'transport', None)
+        write_buffer_size = transport.get_write_buffer_size() if transport else 0
         if (
-            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            pending_bytes >= self.transport_config.drain_bytes
             or interval <= 0
-            or now - self.last_drain_at >= interval
+            or now - last_drain_at >= interval
+            or write_buffer_size >= self.transport_config.pending_buffer_limit
         ):
+            task = self.drain_tasks.pop(key, None)
+            if task:
+                task.cancel()
             await writer.drain()
-            self.pending_drain_bytes = 0
-            self.last_drain_at = now
+            if transport and transport.get_write_buffer_size() >= self.transport_config.pending_buffer_limit:
+                raise BufferError("writer buffer limit exceeded")
+            self.drain_state[key] = (0, now)
+        else:
+            self.drain_state[key] = (pending_bytes, last_drain_at)
+            if key not in self.drain_tasks:
+                self.drain_tasks[key] = asyncio.create_task(self._delayed_drain(writer, key, interval))
+
+    async def _delayed_drain(self, writer: asyncio.StreamWriter, key: int, interval: float):
+        try:
+            await asyncio.sleep(interval)
+            pending = self.drain_state.get(key, (0, 0.0))[0]
+            if pending <= 0 or writer.is_closing():
+                return
+            await writer.drain()
+            self.drain_state[key] = (0, time.monotonic())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        finally:
+            self.drain_tasks.pop(key, None)
 
     async def _close_channel(self, channel: Channel):
         """Close a channel."""
@@ -461,6 +491,11 @@ class TunnelSession:
                 pass
 
         self.channels.pop(channel.channel_id, None)
+        if channel.writer:
+            task = self.drain_tasks.pop(id(channel.writer), None)
+            if task:
+                task.cancel()
+            self.drain_state.pop(id(channel.writer), None)
         self._log(logging.INFO, f"channel close ch={channel.channel_id}")
         self._log(logging.DEBUG, f"Closed ch={channel.channel_id}")
 
@@ -476,6 +511,10 @@ class TunnelSession:
             except asyncio.CancelledError:
                 pass
         self.channel_tasks.clear()
+        for task in self.drain_tasks.values():
+            task.cancel()
+        self.drain_tasks.clear()
+        self.drain_state.clear()
         try:
             self.writer.close()
             await asyncio.wait_for(self.writer.wait_closed(), timeout=5.0)
@@ -564,8 +603,8 @@ class ReverseExitSession:
         self.channels: Dict[int, Channel] = {}
         self.channel_tasks: Dict[int, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
-        self.pending_drain_bytes = 0
-        self.last_drain_at = time.monotonic()
+        self.drain_state: Dict[int, Tuple[int, float]] = {}
+        self.drain_tasks: Dict[int, asyncio.Task] = {}
         self.keepalive_ack_event = asyncio.Event()
         self.connected = True
 
@@ -581,8 +620,8 @@ class ReverseExitSession:
                     if not chunk:
                         break
                     frame_buffer.append(chunk)
-                    for frame in frame_buffer.get_frames():
-                        await self._handle_frame(frame.frame_type, frame.channel_id, frame.payload)
+                    for frame_type, channel_id, payload in frame_buffer.iter_frames():
+                        await self._handle_frame(frame_type, channel_id, payload)
                 except asyncio.TimeoutError:
                     if self.writer.is_closing():
                         break
@@ -618,6 +657,8 @@ class ReverseExitSession:
                     asyncio.open_connection(host, port),
                     timeout=self.tunnel_config.connect_timeout
                 )
+                if os.name != 'nt':
+                    apply_socket_options(writer, self.transport_config)
                 channel = Channel(
                     channel_id=channel_id,
                     host=host,
@@ -685,17 +726,45 @@ class ReverseExitSession:
         if not is_data:
             await writer.drain()
             return
-        self.pending_drain_bytes += byte_count
+        key = id(writer)
+        pending_bytes, last_drain_at = self.drain_state.get(key, (0, time.monotonic()))
+        pending_bytes += byte_count
         interval = self.transport_config.drain_interval_ms / 1000.0
         now = time.monotonic()
+        transport = getattr(writer, 'transport', None)
+        write_buffer_size = transport.get_write_buffer_size() if transport else 0
         if (
-            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            pending_bytes >= self.transport_config.drain_bytes
             or interval <= 0
-            or now - self.last_drain_at >= interval
+            or now - last_drain_at >= interval
+            or write_buffer_size >= self.transport_config.pending_buffer_limit
         ):
+            task = self.drain_tasks.pop(key, None)
+            if task:
+                task.cancel()
             await writer.drain()
-            self.pending_drain_bytes = 0
-            self.last_drain_at = now
+            if transport and transport.get_write_buffer_size() >= self.transport_config.pending_buffer_limit:
+                raise BufferError("writer buffer limit exceeded")
+            self.drain_state[key] = (0, now)
+        else:
+            self.drain_state[key] = (pending_bytes, last_drain_at)
+            if key not in self.drain_tasks:
+                self.drain_tasks[key] = asyncio.create_task(self._delayed_drain(writer, key, interval))
+
+    async def _delayed_drain(self, writer: asyncio.StreamWriter, key: int, interval: float):
+        try:
+            await asyncio.sleep(interval)
+            pending = self.drain_state.get(key, (0, 0.0))[0]
+            if pending <= 0 or writer.is_closing():
+                return
+            await writer.drain()
+            self.drain_state[key] = (0, time.monotonic())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.connected = False
+        finally:
+            self.drain_tasks.pop(key, None)
 
     async def _close_channel(self, channel: Channel):
         if not channel.connected:
@@ -708,6 +777,11 @@ class ReverseExitSession:
             except Exception:
                 pass
         self.channels.pop(channel.channel_id, None)
+        if channel.writer:
+            task = self.drain_tasks.pop(id(channel.writer), None)
+            if task:
+                task.cancel()
+            self.drain_state.pop(id(channel.writer), None)
         logger.info(f"[reverse session {self.session_id}] channel close ch={channel.channel_id}")
 
     async def _cleanup(self):
@@ -721,6 +795,10 @@ class ReverseExitSession:
             except asyncio.CancelledError:
                 pass
         self.channel_tasks.clear()
+        for task in self.drain_tasks.values():
+            task.cancel()
+        self.drain_tasks.clear()
+        self.drain_state.clear()
         try:
             self.writer.close()
             await asyncio.wait_for(self.writer.wait_closed(), timeout=5.0)
