@@ -314,15 +314,20 @@ caps at `tunnel.reconnect_max_delay`, and applies `tunnel.reconnect_jitter` to
 avoid a fixed retry cadence. This is a stability feature, not a guarantee
 against traffic classification.
 
-### Current Topology
+### Current Topologies
 
-The implemented production topology remains normal outbound mode:
+Normal outbound mode remains the default:
 
 `Application / V2Ray -> local SOCKS5 on client -> one outbound TLS tunnel -> server -> Internet`
 
-True reverse-listen/reverse-dial mode is not implemented in this stage. It
-requires separate reachability assumptions and should be designed as an optional
-mode after this normal outbound path is stable.
+Optional true reverse mode reverses only the TCP/TLS connection direction:
+
+`Application / V2Ray -> local SOCKS5 on Access Node -> inbound reverse tunnel from VPS -> Exit Node/VPS -> Internet`
+
+In reverse mode, the Access Node is the TLS server and the Exit Node is the TLS
+client. The active 5-byte binary frame protocol is unchanged. Stage 1 supports
+one active reverse tunnel session. mTLS and multi-session pooling are planned
+as later stages.
 
 ### 🔗 CONNECT Payload Format
 
@@ -787,9 +792,11 @@ Both client and server use Python's `asyncio` for efficient handling of multiple
 
 ## Production Deployment Assumptions
 
-- The server role runs on the outside/VPS host and listens for inbound tunnel sessions.
-- The client role runs beside V2Ray or the application and exposes local SOCKS5.
-- The client initiates the outbound tunnel connection; this stage does not add reverse mode.
+- In normal mode, the server role runs on the outside/VPS host and listens for inbound tunnel sessions.
+- In normal mode, the client role runs beside V2Ray or the application and exposes local SOCKS5.
+- In reverse mode, the Iran-side Access Node runs `client.py` with `client.mode: reverse-listen`; the VPS Exit Node runs `server.py` with `server.mode: reverse-dial`.
+- Reverse mode requires the Access Node reverse listener port to be reachable from the VPS. NAT/CGNAT requires port forwarding or a different rendezvous/relay design.
+- Reverse mode TLS uses the Access Node certificate. Let's Encrypt HTTP-01, DNS-01/manual, existing certificates, and private CA fallback are installer-supported.
 - `scripts/bootstrap.sh` is the supported GitHub entry point for fresh installs and upgrades. It downloads a selected branch/tag/ref, then delegates to `install.sh`.
 - Production installs use `/opt/smtp-tunnel` for application code, `/opt/smtp-tunnel/venv` for Python dependencies, `/etc/smtp-tunnel/config.yaml` for active config, `/etc/smtp-tunnel/users.yaml` for users, and `/etc/smtp-tunnel/certs` for private CA/server certificates.
 - Server-side client packages are tar.gz bundles containing one user's client config, `ca.crt` when available, runtime files, and install notes. They must not include server private keys or other users' credentials.
