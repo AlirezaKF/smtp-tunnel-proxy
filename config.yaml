@@ -69,6 +69,11 @@ tunnel:
   # Jitter ratio for reconnect delay. 0.35 means +/-35%.
   reconnect_jitter: 0.35
 
+  # Number of reverse-dial tunnel sessions from VPS to Access Node.
+  # Normal mode and generic examples default to 1.
+  # Recommended starting point for reverse mode throughput testing: 4.
+  connections: 1
+
 # ============================================================================
 # SMTP Compatibility Configuration - Optional
 # ============================================================================
@@ -105,6 +110,9 @@ smtp:
 #       auto_renew: true
 #     mtls:
 #       enabled: false  # planned for Stage 1b
+#
+# tunnel:
+#   connections: 4  # recommended starting point for reverse-dial mode
 #
 # Exit Node / VPS (server.py):
 #
