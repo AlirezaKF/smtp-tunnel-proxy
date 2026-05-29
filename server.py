@@ -22,6 +22,7 @@ import argparse
 import os
 import random
 import time
+import socket
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
@@ -36,14 +37,19 @@ from common import (
     FRAME_KEEPALIVE,
     FRAME_KEEPALIVE_ACK,
     FrameProtocolError,
+    LoggingConfig,
     MODE_NORMAL,
     MODE_REVERSE_DIAL,
     ReverseDialConfig,
+    TransportConfig,
     TunnelConfig,
     TunnelCrypto,
+    build_logging_config,
     build_reverse_dial_config,
     build_tunnel_config,
+    build_transport_config,
     encode_frame,
+    format_destination,
     get_server_mode,
     load_config,
     load_users,
@@ -60,6 +66,23 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('smtp-tunnel-server')
+
+
+def apply_socket_options(writer: asyncio.StreamWriter, transport_config: TransportConfig):
+    sock = writer.get_extra_info('socket') if writer else None
+    if not sock:
+        return
+    try:
+        if transport_config.tcp_nodelay and sock.family in (socket.AF_INET, socket.AF_INET6):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if transport_config.tcp_keepalive:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if transport_config.socket_send_buffer > 0:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, transport_config.socket_send_buffer)
+        if transport_config.socket_recv_buffer > 0:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, transport_config.socket_recv_buffer)
+    except OSError as e:
+        logger.debug(f"Could not apply socket options: {e}")
 
 
 # ============================================================================
@@ -88,7 +111,9 @@ class TunnelSession:
         config: ServerConfig,
         ssl_context: ssl.SSLContext,
         users: Dict[str, UserConfig],
-        tunnel_config: TunnelConfig = None
+        tunnel_config: TunnelConfig = None,
+        logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
     ):
         self.reader = reader
         self.writer = writer
@@ -96,11 +121,15 @@ class TunnelSession:
         self.ssl_context = ssl_context
         self.users = users
         self.tunnel_config = tunnel_config or TunnelConfig()
+        self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or TransportConfig()
         self.authenticated = False
         self.binary_mode = False
         self.channels: Dict[int, Channel] = {}
         self.channel_tasks: Dict[int, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
+        self.pending_drain_bytes = 0
+        self.last_drain_at = time.monotonic()
         self.keepalive_ack_event = asyncio.Event()
 
         # User info (set after authentication)
@@ -126,6 +155,7 @@ class TunnelSession:
 
     async def run(self):
         """Main session handler."""
+        apply_socket_options(self.writer, self.transport_config)
         logger.info(f"Connection from {self.peer_str}")
 
         try:
@@ -242,6 +272,7 @@ class TunnelSession:
 
         self.writer._transport = new_transport
         self.reader._transport = new_transport
+        apply_socket_options(self.writer, self.transport_config)
         logger.debug(f"TLS established: {self.peer_str}")
 
     async def _send_line(self, line: str):
@@ -266,7 +297,10 @@ class TunnelSession:
         while True:
             # Read data
             try:
-                chunk = await asyncio.wait_for(self.reader.read(65536), timeout=60.0)
+                chunk = await asyncio.wait_for(
+                    self.reader.read(self.transport_config.read_chunk_size),
+                    timeout=60.0
+                )
                 if not chunk:
                     self._log(logging.DEBUG, "Connection closed by client")
                     break
@@ -308,12 +342,12 @@ class TunnelSession:
         try:
             host, port = parse_connect_payload(payload)
 
-            self._log(logging.INFO, f"CONNECT ch={channel_id} -> {host}:{port}")
+            self._log(logging.INFO, f"CONNECT ch={channel_id} destination={format_destination(host, port, self.logging_config)}")
 
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=30.0
+                    timeout=self.tunnel_config.connect_timeout
                 )
 
                 channel = Channel(
@@ -332,10 +366,10 @@ class TunnelSession:
 
                 # Start reading from destination after the open acknowledgement.
                 self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
-                self._log(logging.INFO, f"CONNECTED ch={channel_id}")
+                self._log(logging.INFO, f"CONNECT success ch={channel_id}")
 
             except Exception as e:
-                self._log(logging.ERROR, f"Connect failed ch={channel_id}: {e}")
+                self._log(logging.ERROR, f"CONNECT failure ch={channel_id}: {e}")
                 await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
 
         except FrameProtocolError as e:
@@ -351,7 +385,7 @@ class TunnelSession:
         if channel and channel.connected and channel.writer:
             try:
                 channel.writer.write(payload)
-                await channel.writer.drain()
+                await self._drain_writer(channel.writer, len(payload), is_data=True)
             except:
                 await self._close_channel(channel)
         else:
@@ -369,7 +403,7 @@ class TunnelSession:
         """Read from destination and send to client."""
         try:
             while channel.connected:
-                data = await channel.reader.read(32768)
+                data = await channel.reader.read(self.transport_config.read_chunk_size)
                 if not data:
                     break
 
@@ -391,11 +425,27 @@ class TunnelSession:
             async with self.write_lock:
                 frame = encode_frame(frame_type, channel_id, payload)
                 self.writer.write(frame)
-                await self.writer.drain()
+                await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
         except FrameProtocolError as e:
             self._log(logging.ERROR, f"Refusing to send malformed tunnel frame: {e}")
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass
+
+    async def _drain_writer(self, writer: asyncio.StreamWriter, byte_count: int, is_data: bool):
+        if not is_data:
+            await writer.drain()
+            return
+        self.pending_drain_bytes += byte_count
+        interval = self.transport_config.drain_interval_ms / 1000.0
+        now = time.monotonic()
+        if (
+            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            or interval <= 0
+            or now - self.last_drain_at >= interval
+        ):
+            await writer.drain()
+            self.pending_drain_bytes = 0
+            self.last_drain_at = now
 
     async def _close_channel(self, channel: Channel):
         """Close a channel."""
@@ -411,6 +461,7 @@ class TunnelSession:
                 pass
 
         self.channels.pop(channel.channel_id, None)
+        self._log(logging.INFO, f"channel close ch={channel.channel_id}")
         self._log(logging.DEBUG, f"Closed ch={channel.channel_id}")
 
     async def _cleanup(self):
@@ -441,11 +492,15 @@ class TunnelServer:
         self,
         config: ServerConfig,
         users: Dict[str, UserConfig],
-        tunnel_config: TunnelConfig = None
+        tunnel_config: TunnelConfig = None,
+        logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
     ):
         self.config = config
         self.users = users
         self.tunnel_config = tunnel_config or TunnelConfig()
+        self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or TransportConfig()
         self.ssl_context = self._create_ssl_context()
 
     def _create_ssl_context(self) -> ssl.SSLContext:
@@ -461,7 +516,9 @@ class TunnelServer:
             self.config,
             self.ssl_context,
             self.users,
-            self.tunnel_config
+            self.tunnel_config,
+            self.logging_config,
+            self.transport_config,
         )
         await session.run()
 
@@ -493,16 +550,22 @@ class ReverseExitSession:
         writer: asyncio.StreamWriter,
         reverse_config: ReverseDialConfig,
         tunnel_config: TunnelConfig = None,
+        logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
         session_id: int = 1,
     ):
         self.reader = reader
         self.writer = writer
         self.reverse_config = reverse_config
         self.tunnel_config = tunnel_config or TunnelConfig()
+        self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or TransportConfig()
         self.session_id = session_id
         self.channels: Dict[int, Channel] = {}
         self.channel_tasks: Dict[int, asyncio.Task] = {}
         self.write_lock = asyncio.Lock()
+        self.pending_drain_bytes = 0
+        self.last_drain_at = time.monotonic()
         self.keepalive_ack_event = asyncio.Event()
         self.connected = True
 
@@ -511,7 +574,10 @@ class ReverseExitSession:
         try:
             while self.connected:
                 try:
-                    chunk = await asyncio.wait_for(self.reader.read(65536), timeout=60.0)
+                    chunk = await asyncio.wait_for(
+                        self.reader.read(self.transport_config.read_chunk_size),
+                        timeout=60.0
+                    )
                     if not chunk:
                         break
                     frame_buffer.append(chunk)
@@ -543,11 +609,14 @@ class ReverseExitSession:
     async def _handle_connect(self, channel_id: int, payload: bytes):
         try:
             host, port = parse_connect_payload(payload)
-            logger.info(f"[reverse session {self.session_id}] CONNECT ch={channel_id} -> {host}:{port}")
+            logger.info(
+                f"[reverse session {self.session_id}] CONNECT start ch={channel_id} "
+                f"destination={format_destination(host, port, self.logging_config)}"
+            )
             try:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port),
-                    timeout=30.0
+                    timeout=self.tunnel_config.connect_timeout
                 )
                 channel = Channel(
                     channel_id=channel_id,
@@ -560,8 +629,9 @@ class ReverseExitSession:
                 self.channels[channel_id] = channel
                 await self._send_frame(FRAME_CONNECT_OK, channel_id)
                 self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
+                logger.info(f"[reverse session {self.session_id}] CONNECT success ch={channel_id}")
             except Exception as e:
-                logger.warning(f"[reverse session {self.session_id}] Connect failed ch={channel_id}: {e}")
+                logger.warning(f"[reverse session {self.session_id}] CONNECT failure ch={channel_id}: {e}")
                 await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
         except FrameProtocolError as e:
             logger.warning(f"[reverse session {self.session_id}] Invalid CONNECT ch={channel_id}: {e}")
@@ -572,7 +642,7 @@ class ReverseExitSession:
         if channel and channel.connected and channel.writer:
             try:
                 channel.writer.write(payload)
-                await channel.writer.drain()
+                await self._drain_writer(channel.writer, len(payload), is_data=True)
             except Exception:
                 await self._close_channel(channel)
         else:
@@ -586,7 +656,7 @@ class ReverseExitSession:
     async def _channel_reader(self, channel: Channel):
         try:
             while channel.connected and self.connected:
-                data = await channel.reader.read(32768)
+                data = await channel.reader.read(self.transport_config.read_chunk_size)
                 if not data:
                     break
                 await self._send_frame(FRAME_DATA, channel.channel_id, data)
@@ -603,12 +673,29 @@ class ReverseExitSession:
             return
         try:
             async with self.write_lock:
-                self.writer.write(encode_frame(frame_type, channel_id, payload))
-                await self.writer.drain()
+                frame = encode_frame(frame_type, channel_id, payload)
+                self.writer.write(frame)
+                await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
         except FrameProtocolError as e:
             logger.error(f"[reverse session {self.session_id}] Refusing malformed frame: {e}")
         except (ConnectionResetError, BrokenPipeError, OSError):
             self.connected = False
+
+    async def _drain_writer(self, writer: asyncio.StreamWriter, byte_count: int, is_data: bool):
+        if not is_data:
+            await writer.drain()
+            return
+        self.pending_drain_bytes += byte_count
+        interval = self.transport_config.drain_interval_ms / 1000.0
+        now = time.monotonic()
+        if (
+            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            or interval <= 0
+            or now - self.last_drain_at >= interval
+        ):
+            await writer.drain()
+            self.pending_drain_bytes = 0
+            self.last_drain_at = now
 
     async def _close_channel(self, channel: Channel):
         if not channel.connected:
@@ -621,7 +708,7 @@ class ReverseExitSession:
             except Exception:
                 pass
         self.channels.pop(channel.channel_id, None)
-        logger.debug(f"[reverse session {self.session_id}] Closed ch={channel.channel_id}")
+        logger.info(f"[reverse session {self.session_id}] channel close ch={channel.channel_id}")
 
     async def _cleanup(self):
         for channel in list(self.channels.values()):
@@ -644,9 +731,17 @@ class ReverseExitSession:
 class ReverseDialer:
     """Exit Node dialer for reverse mode."""
 
-    def __init__(self, reverse_config: ReverseDialConfig, tunnel_config: TunnelConfig = None):
+    def __init__(
+        self,
+        reverse_config: ReverseDialConfig,
+        tunnel_config: TunnelConfig = None,
+        logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
+    ):
         self.reverse_config = reverse_config
         self.tunnel_config = tunnel_config or TunnelConfig()
+        self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or TransportConfig()
 
     def _create_ssl_context(self) -> ssl.SSLContext:
         tls = self.reverse_config.tls
@@ -712,6 +807,7 @@ class ReverseDialer:
         )
         writer._transport = new_transport
         reader._transport = new_transport
+        apply_socket_options(writer, self.transport_config)
 
         if self.reverse_config.tls.verify_mode == 'fingerprint':
             ssl_object = writer.get_extra_info('ssl_object')
@@ -763,11 +859,20 @@ class ReverseDialer:
             asyncio.open_connection(self.reverse_config.access_host, self.reverse_config.access_port),
             timeout=30.0,
         )
+        apply_socket_options(writer, self.transport_config)
         try:
             if not await self._smtp_handshake(reader, writer):
                 raise ConnectionError("reverse SMTP/TLS/auth handshake failed")
             logger.info(f"Reverse dial session {session_id} authenticated")
-            session = ReverseExitSession(reader, writer, self.reverse_config, self.tunnel_config, session_id=session_id)
+            session = ReverseExitSession(
+                reader,
+                writer,
+                self.reverse_config,
+                self.tunnel_config,
+                self.logging_config,
+                self.transport_config,
+                session_id=session_id,
+            )
             await session.run()
         finally:
             try:
@@ -817,7 +922,13 @@ class ReverseDialer:
                     pass
 
 
-def build_server_settings(config_data: dict, args) -> Tuple[ServerConfig, TunnelConfig, str]:
+def build_server_settings(config_data: dict, args) -> Tuple[
+    ServerConfig,
+    TunnelConfig,
+    str,
+    LoggingConfig,
+    TransportConfig,
+]:
     """Build validated server settings from config and CLI overrides."""
     server_conf = (config_data or {}).get('server', {}) or {}
 
@@ -832,7 +943,9 @@ def build_server_settings(config_data: dict, args) -> Tuple[ServerConfig, Tunnel
     )
     users_file = args.users or config.users_file
     tunnel_config = build_tunnel_config(config_data)
-    return config, tunnel_config, users_file
+    logging_config = build_logging_config(config_data)
+    transport_config = build_transport_config(config_data)
+    return config, tunnel_config, users_file, logging_config, transport_config
 
 
 def check_server_config(config_path: str, args) -> int:
@@ -843,7 +956,7 @@ def check_server_config(config_path: str, args) -> int:
     try:
         config_data = load_config(config_path)
         mode = get_server_mode(config_data)
-        config, tunnel_config, users_file = build_server_settings(config_data, args)
+        config, tunnel_config, users_file, logging_config, transport_config = build_server_settings(config_data, args)
         reverse_config = build_reverse_dial_config(config_data) if mode == MODE_REVERSE_DIAL else None
     except FileNotFoundError:
         print(f"ERROR: config file not found: {config_path}")
@@ -908,6 +1021,9 @@ def check_server_config(config_path: str, args) -> int:
         print(f"  TLS server name: {reverse_config.tls_server_name}")
         print(f"  TLS verify mode: {reverse_config.tls.verify_mode}")
     print(f"  Configured keepalive interval for generated/shared configs: {tunnel_config.keepalive_interval:g}s")
+    print(f"  Connect timeout: {tunnel_config.connect_timeout:g}s")
+    print(f"  Log destinations: {logging_config.log_destinations}")
+    print(f"  Read chunk size: {transport_config.read_chunk_size}")
 
     for warning in warnings:
         print(f"WARNING: {warning}")
@@ -942,7 +1058,7 @@ def main():
 
     try:
         mode = get_server_mode(config_data)
-        config, tunnel_config, users_file = build_server_settings(config_data, args)
+        config, tunnel_config, users_file, logging_config, transport_config = build_server_settings(config_data, args)
     except Exception as e:
         logger.error(f"Invalid server config: {e}")
         return 1
@@ -950,7 +1066,7 @@ def main():
     if mode == MODE_REVERSE_DIAL:
         try:
             reverse_config = build_reverse_dial_config(config_data)
-            dialer = ReverseDialer(reverse_config, tunnel_config)
+            dialer = ReverseDialer(reverse_config, tunnel_config, logging_config, transport_config)
             asyncio.run(dialer.run_forever())
         except KeyboardInterrupt:
             logger.info("Reverse dialer stopped")
@@ -974,7 +1090,7 @@ def main():
         logger.error(f"Certificate not found: {config.cert_file}")
         return 1
 
-    server = TunnelServer(config, users, tunnel_config)
+    server = TunnelServer(config, users, tunnel_config, logging_config, transport_config)
 
     try:
         asyncio.run(server.start())
