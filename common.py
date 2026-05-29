@@ -13,6 +13,7 @@ import hmac
 import os
 import base64
 import time
+import ssl
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -32,6 +33,15 @@ PROTOCOL_VERSION = 1
 MAX_PAYLOAD_SIZE = 65535
 NONCE_SIZE = 12
 TAG_SIZE = 16
+MODE_NORMAL = 'normal'
+MODE_REVERSE_LISTEN = 'reverse-listen'
+MODE_REVERSE_DIAL = 'reverse-dial'
+TLS_CERT_MODE_LETSENCRYPT = 'letsencrypt'
+TLS_CERT_MODE_EXISTING = 'existing'
+TLS_CERT_MODE_PRIVATE_CA = 'private-ca'
+TLS_VERIFY_SYSTEM_CA = 'system-ca'
+TLS_VERIFY_PRIVATE_CA = 'private-ca'
+TLS_VERIFY_FINGERPRINT = 'fingerprint'
 
 # Message types
 class MsgType(IntEnum):
@@ -935,12 +945,82 @@ class TunnelConfig:
     reconnect_initial_delay: float = 2.0
     reconnect_max_delay: float = 30.0
     reconnect_jitter: float = 0.2
+    connections: int = 1
 
 
 @dataclass
 class SMTPConfig:
     """SMTP compatibility knobs."""
     ehlo_name: str = 'tunnel-client.local'
+
+
+@dataclass
+class ReverseListenTLSConfig:
+    """TLS server settings for Access Node reverse-listen mode."""
+    cert_mode: str = TLS_CERT_MODE_EXISTING
+    domain: str = ''
+    cert_file: str = ''
+    key_file: str = ''
+    letsencrypt_email: str = ''
+    letsencrypt_challenge: str = 'http-01'
+    auto_renew: bool = True
+
+
+@dataclass
+class ReverseMTLSConfig:
+    """Optional mTLS settings for reverse mode."""
+    enabled: bool = False
+    client_ca_cert: str = ''
+    client_cert_file: str = ''
+    client_key_file: str = ''
+
+
+@dataclass
+class ReverseListenConfig:
+    """Access Node reverse listener settings."""
+    listen_host: str = '0.0.0.0'
+    listen_port: int = 587
+    auth_username: str = ''
+    auth_secret: str = ''
+    auth_secret_file: str = ''
+    allowed_dialer_ips: List[str] = None
+    tls: ReverseListenTLSConfig = None
+    mtls: ReverseMTLSConfig = None
+
+    def __post_init__(self):
+        if self.allowed_dialer_ips is None:
+            self.allowed_dialer_ips = []
+        if self.tls is None:
+            self.tls = ReverseListenTLSConfig()
+        if self.mtls is None:
+            self.mtls = ReverseMTLSConfig()
+
+
+@dataclass
+class ReverseDialTLSConfig:
+    """TLS client verification settings for Exit Node reverse-dial mode."""
+    verify_mode: str = TLS_VERIFY_SYSTEM_CA
+    ca_cert: str = ''
+    cert_fingerprint_sha256: str = ''
+
+
+@dataclass
+class ReverseDialConfig:
+    """Exit Node reverse dialer settings."""
+    access_host: str = ''
+    access_port: int = 587
+    tls_server_name: str = ''
+    auth_username: str = ''
+    auth_secret: str = ''
+    auth_secret_file: str = ''
+    tls: ReverseDialTLSConfig = None
+    mtls: ReverseMTLSConfig = None
+
+    def __post_init__(self):
+        if self.tls is None:
+            self.tls = ReverseDialTLSConfig()
+        if self.mtls is None:
+            self.mtls = ReverseMTLSConfig()
 
 
 @dataclass
@@ -989,6 +1069,98 @@ def _as_port(value, default: int, name: str) -> int:
     return parsed
 
 
+def _as_bool(value, default: bool, name: str) -> bool:
+    """Parse a boolean config value."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ('1', 'true', 'yes', 'on'):
+            return True
+        if lowered in ('0', 'false', 'no', 'off'):
+            return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _as_int(value, default: int, name: str, minimum: int = None, maximum: int = None) -> int:
+    """Parse an integer config value with bounds."""
+    if value is None:
+        value = default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer")
+    if minimum is not None and parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+    return parsed
+
+
+def _as_str_list(value, name: str) -> List[str]:
+    """Parse a list of strings."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{name} must be a list")
+    parsed = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{name} entries must be non-empty strings")
+        parsed.append(item.strip())
+    return parsed
+
+
+def load_secret_value(inline_secret: str = '', secret_file: str = '', name: str = 'secret') -> str:
+    """Load a secret from either an inline value or a file, preferring the file."""
+    if secret_file:
+        if not os.path.exists(secret_file):
+            raise ValueError(f"{name}_file does not exist: {secret_file}")
+        if not os.path.isfile(secret_file):
+            raise ValueError(f"{name}_file is not a file: {secret_file}")
+        with open(secret_file, 'r', encoding='utf-8') as f:
+            secret = f.readline().strip()
+        if not secret:
+            raise ValueError(f"{name}_file is empty: {secret_file}")
+        return secret
+    return (inline_secret or '').strip()
+
+
+def normalize_sha256_fingerprint(value: str) -> str:
+    """Normalize a SHA-256 fingerprint to lowercase hex without separators."""
+    normalized = (value or '').replace(':', '').replace(' ', '').lower()
+    if normalized and (len(normalized) != 64 or any(c not in '0123456789abcdef' for c in normalized)):
+        raise ValueError("SHA-256 certificate fingerprint must be 64 hex characters")
+    return normalized
+
+
+def sha256_fingerprint_from_der(cert_der: bytes) -> str:
+    """Return lowercase SHA-256 fingerprint for DER certificate bytes."""
+    return hashlib.sha256(cert_der).hexdigest()
+
+
+def sha256_fingerprint_from_pem_file(path: str) -> str:
+    """Return SHA-256 fingerprint for the first PEM certificate in a file."""
+    with open(path, 'r', encoding='utf-8') as f:
+        pem = f.read()
+    der = ssl.PEM_cert_to_DER_cert(pem)
+    return sha256_fingerprint_from_der(der)
+
+
+def verify_peer_fingerprint(ssl_object, expected_fingerprint: str) -> bool:
+    """Verify the peer certificate fingerprint from a live TLS connection."""
+    expected = normalize_sha256_fingerprint(expected_fingerprint)
+    if not expected or ssl_object is None:
+        return False
+    cert_der = ssl_object.getpeercert(binary_form=True)
+    if not cert_der:
+        return False
+    actual = sha256_fingerprint_from_der(cert_der)
+    return hmac.compare_digest(actual, expected)
+
+
 def build_tunnel_config(config_data: dict) -> TunnelConfig:
     """Build TunnelConfig from raw YAML with backward-compatible defaults."""
     tunnel_conf = (config_data or {}).get('tunnel', {}) or {}
@@ -1013,9 +1185,137 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
             tunnel_conf.get('reconnect_jitter'), 0.2,
             'tunnel.reconnect_jitter', minimum=0.0
         ),
+        connections=_as_int(
+            tunnel_conf.get('connections'), 1,
+            'tunnel.connections', minimum=1, maximum=64
+        ),
     )
     if config.reconnect_max_delay < config.reconnect_initial_delay:
         raise ValueError("tunnel.reconnect_max_delay must be >= tunnel.reconnect_initial_delay")
+    return config
+
+
+def get_client_mode(config_data: dict) -> str:
+    """Return client mode with backward-compatible default."""
+    client_conf = (config_data or {}).get('client', {}) or {}
+    mode = client_conf.get('mode', MODE_NORMAL) or MODE_NORMAL
+    if mode not in (MODE_NORMAL, MODE_REVERSE_LISTEN):
+        raise ValueError("client.mode must be normal or reverse-listen")
+    return mode
+
+
+def get_server_mode(config_data: dict) -> str:
+    """Return server mode with backward-compatible default."""
+    server_conf = (config_data or {}).get('server', {}) or {}
+    mode = server_conf.get('mode', MODE_NORMAL) or MODE_NORMAL
+    if mode not in (MODE_NORMAL, MODE_REVERSE_DIAL):
+        raise ValueError("server.mode must be normal or reverse-dial")
+    return mode
+
+
+def build_reverse_listen_config(config_data: dict) -> ReverseListenConfig:
+    """Build reverse-listen config from nested or legacy-flat client keys."""
+    client_conf = (config_data or {}).get('client', {}) or {}
+    reverse_conf = client_conf.get('reverse', {}) or {}
+    tls_conf = reverse_conf.get('tls', client_conf.get('reverse_tls', {}) or {}) or {}
+    mtls_conf = reverse_conf.get('mtls', client_conf.get('reverse_mtls', {}) or {}) or {}
+
+    cert_mode = tls_conf.get('cert_mode', TLS_CERT_MODE_EXISTING) or TLS_CERT_MODE_EXISTING
+    if cert_mode in ('letsencrypt-http', 'letsencrypt-dns'):
+        cert_mode = TLS_CERT_MODE_LETSENCRYPT
+    if cert_mode not in (TLS_CERT_MODE_LETSENCRYPT, TLS_CERT_MODE_EXISTING, TLS_CERT_MODE_PRIVATE_CA):
+        raise ValueError("client.reverse.tls.cert_mode must be letsencrypt, existing, or private-ca")
+
+    challenge = tls_conf.get('letsencrypt_challenge', 'http-01') or 'http-01'
+    if challenge not in ('http-01', 'dns-01', 'manual'):
+        raise ValueError("client.reverse.tls.letsencrypt_challenge must be http-01, dns-01, or manual")
+
+    tls = ReverseListenTLSConfig(
+        cert_mode=cert_mode,
+        domain=tls_conf.get('domain', '') or '',
+        cert_file=tls_conf.get('cert_file', '') or '',
+        key_file=tls_conf.get('key_file', '') or '',
+        letsencrypt_email=tls_conf.get('letsencrypt_email', '') or '',
+        letsencrypt_challenge=challenge,
+        auto_renew=_as_bool(tls_conf.get('auto_renew'), True, 'client.reverse.tls.auto_renew'),
+    )
+
+    mtls = ReverseMTLSConfig(
+        enabled=_as_bool(mtls_conf.get('enabled'), False, 'client.reverse.mtls.enabled'),
+        client_ca_cert=mtls_conf.get('client_ca_cert', '') or '',
+    )
+
+    config = ReverseListenConfig(
+        listen_host=reverse_conf.get('listen_host', client_conf.get('reverse_listen_host', '0.0.0.0')) or '0.0.0.0',
+        listen_port=_as_port(
+            reverse_conf.get('listen_port', client_conf.get('reverse_listen_port')),
+            587,
+            'client.reverse.listen_port'
+        ),
+        auth_username=reverse_conf.get('auth_username', client_conf.get('username', '')) or '',
+        auth_secret=reverse_conf.get('auth_secret', client_conf.get('secret', '')) or '',
+        auth_secret_file=reverse_conf.get('auth_secret_file', client_conf.get('secret_file', '')) or '',
+        allowed_dialer_ips=_as_str_list(
+            reverse_conf.get('allowed_dialer_ips', client_conf.get('reverse_allowed_dialer_ips')),
+            'client.reverse.allowed_dialer_ips'
+        ),
+        tls=tls,
+        mtls=mtls,
+    )
+    config.auth_secret = load_secret_value(config.auth_secret, config.auth_secret_file, 'client.reverse.auth_secret')
+    return config
+
+
+def build_reverse_dial_config(config_data: dict) -> ReverseDialConfig:
+    """Build reverse-dial config from nested or legacy-flat server keys."""
+    server_conf = (config_data or {}).get('server', {}) or {}
+    reverse_conf = server_conf.get('reverse', {}) or {}
+    tls_conf = reverse_conf.get('tls', {}) or {}
+    mtls_conf = reverse_conf.get('mtls', server_conf.get('reverse_mtls', {}) or {}) or {}
+
+    verify_mode = tls_conf.get('verify_mode', 'system-ca') or 'system-ca'
+    legacy_ca = server_conf.get('reverse_ca_cert')
+    legacy_fingerprint = server_conf.get('reverse_cert_fingerprint_sha256')
+    if legacy_ca and verify_mode == 'system-ca':
+        verify_mode = TLS_VERIFY_PRIVATE_CA
+    if legacy_fingerprint:
+        verify_mode = TLS_VERIFY_FINGERPRINT
+
+    if verify_mode not in (TLS_VERIFY_SYSTEM_CA, TLS_VERIFY_PRIVATE_CA, TLS_VERIFY_FINGERPRINT):
+        raise ValueError("server.reverse.tls.verify_mode must be system-ca, private-ca, or fingerprint")
+
+    tls = ReverseDialTLSConfig(
+        verify_mode=verify_mode,
+        ca_cert=tls_conf.get('ca_cert', legacy_ca or '') or '',
+        cert_fingerprint_sha256=normalize_sha256_fingerprint(
+            tls_conf.get('cert_fingerprint_sha256', legacy_fingerprint or '') or ''
+        ),
+    )
+
+    mtls = ReverseMTLSConfig(
+        enabled=_as_bool(mtls_conf.get('enabled'), False, 'server.reverse.mtls.enabled'),
+        client_cert_file=mtls_conf.get('client_cert_file', '') or '',
+        client_key_file=mtls_conf.get('client_key_file', '') or '',
+    )
+
+    access_host = reverse_conf.get('access_host', server_conf.get('reverse_client_host', '')) or ''
+    tls_server_name = reverse_conf.get('tls_server_name', server_conf.get('reverse_tls_server_name', access_host)) or access_host
+
+    config = ReverseDialConfig(
+        access_host=access_host,
+        access_port=_as_port(
+            reverse_conf.get('access_port', server_conf.get('reverse_client_port')),
+            587,
+            'server.reverse.access_port'
+        ),
+        tls_server_name=tls_server_name,
+        auth_username=reverse_conf.get('auth_username', server_conf.get('reverse_username', '')) or '',
+        auth_secret=reverse_conf.get('auth_secret', server_conf.get('reverse_secret', '')) or '',
+        auth_secret_file=reverse_conf.get('auth_secret_file', server_conf.get('reverse_secret_file', '')) or '',
+        tls=tls,
+        mtls=mtls,
+    )
+    config.auth_secret = load_secret_value(config.auth_secret, config.auth_secret_file, 'server.reverse.auth_secret')
     return config
 
 
