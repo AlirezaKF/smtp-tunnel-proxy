@@ -38,17 +38,24 @@ from common import (
     FRAME_KEEPALIVE_ACK,
     FrameProtocolError,
     IPWhitelist,
+    LoggingConfig,
     MAX_CHANNEL_ID,
+    MetricsConfig,
     MODE_NORMAL,
     MODE_REVERSE_LISTEN,
     ReverseListenConfig,
     SMTPConfig,
+    TransportConfig,
     TunnelConfig,
     TunnelCrypto,
     UserConfig,
+    build_logging_config,
+    build_metrics_config,
     build_reverse_listen_config,
     build_smtp_config,
     build_tunnel_config,
+    build_transport_config,
+    format_destination,
     get_client_mode,
     encode_frame,
     load_config,
@@ -98,12 +105,16 @@ class TunnelClient:
         config: ClientConfig,
         ca_cert: str = None,
         tunnel_config: TunnelConfig = None,
-        smtp_config: SMTPConfig = None
+        smtp_config: SMTPConfig = None,
+        transport_config: TransportConfig = None,
+        logging_config: LoggingConfig = None,
     ):
         self.config = config
         self.ca_cert = ca_cert
         self.tunnel_config = tunnel_config or TunnelConfig()
         self.smtp_config = smtp_config or SMTPConfig()
+        self.transport_config = transport_config or TransportConfig()
+        self.logging_config = logging_config or LoggingConfig()
 
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -113,7 +124,7 @@ class TunnelClient:
         self.opening_channels: Set[int] = set()
         self.pending_channel_data: Dict[int, List[bytes]] = {}
         self.pending_close_channels: Set[int] = set()
-        self.pending_channel_data_limit = 1024 * 1024
+        self.pending_channel_data_limit = self.transport_config.pending_buffer_limit
         self.next_channel_id = 1
         self.channel_lock = asyncio.Lock()
 
@@ -121,7 +132,11 @@ class TunnelClient:
         self.connect_results: Dict[int, bool] = {}
 
         self.write_lock = asyncio.Lock()
+        self.pending_drain_bytes = 0
+        self.last_drain_at = time.monotonic()
         self.keepalive_ack_event = asyncio.Event()
+        self.session_id = 0
+        self.session_pool = None
 
     async def connect(self) -> bool:
         """Connect and do SMTP handshake, then switch to binary mode."""
@@ -132,6 +147,7 @@ class TunnelClient:
                 asyncio.open_connection(self.config.server_host, self.config.server_port),
                 timeout=30.0
             )
+            self._apply_socket_options()
 
             # SMTP Handshake
             if not await self._smtp_handshake():
@@ -226,7 +242,24 @@ class TunnelClient:
 
         self.writer._transport = new_transport
         self.reader._transport = new_transport
+        self._apply_socket_options()
         logger.debug("TLS established")
+
+    def _apply_socket_options(self):
+        sock = self.writer.get_extra_info('socket') if self.writer else None
+        if not sock:
+            return
+        try:
+            if self.transport_config.tcp_nodelay and sock.family in (socket.AF_INET, socket.AF_INET6):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if self.transport_config.tcp_keepalive:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if self.transport_config.socket_send_buffer > 0:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.transport_config.socket_send_buffer)
+            if self.transport_config.socket_recv_buffer > 0:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.transport_config.socket_recv_buffer)
+        except OSError as e:
+            logger.debug(f"Could not apply socket options: {e}")
 
     async def _send_line(self, line: str):
         self.writer.write(f"{line}\r\n".encode())
@@ -252,6 +285,22 @@ class TunnelClient:
                 continue
             return False
 
+    async def _drain_writer(self, writer: asyncio.StreamWriter, byte_count: int, is_data: bool):
+        if not is_data:
+            await writer.drain()
+            return
+        self.pending_drain_bytes += byte_count
+        interval = self.transport_config.drain_interval_ms / 1000.0
+        now = time.monotonic()
+        if (
+            self.pending_drain_bytes >= self.transport_config.drain_bytes
+            or interval <= 0
+            or now - self.last_drain_at >= interval
+        ):
+            await writer.drain()
+            self.pending_drain_bytes = 0
+            self.last_drain_at = now
+
     async def start_receiver(self):
         """Start background task to receive frames from server."""
         asyncio.create_task(self._receiver_loop())
@@ -262,9 +311,14 @@ class TunnelClient:
 
         while self.connected:
             try:
-                chunk = await asyncio.wait_for(self.reader.read(65536), timeout=300.0)
+                chunk = await asyncio.wait_for(
+                    self.reader.read(self.transport_config.read_chunk_size),
+                    timeout=300.0
+                )
                 if not chunk:
                     break
+                if self.session_pool:
+                    await self.session_pool.record_read(self.session_id, len(chunk))
                 frame_buffer.append(chunk)
 
                 for frame in frame_buffer.get_frames():
@@ -338,7 +392,7 @@ class TunnelClient:
             if channel and channel.connected:
                 try:
                     channel.writer.write(payload)
-                    await channel.writer.drain()
+                    await self._drain_writer(channel.writer, len(payload), is_data=True)
                 except:
                     await self._close_channel(channel)
             elif channel_id in self.opening_channels or channel_id in self.connect_events:
@@ -367,19 +421,25 @@ class TunnelClient:
         elif frame_type == FRAME_KEEPALIVE_ACK:
             self.keepalive_ack_event.set()
 
-    async def send_frame(self, frame_type: int, channel_id: int, payload: bytes = b''):
+    async def send_frame(self, frame_type: int, channel_id: int, payload: bytes = b'') -> bool:
         """Send frame to server."""
         if not self.connected or not self.writer:
-            return
+            return False
         async with self.write_lock:
             try:
                 frame = encode_frame(frame_type, channel_id, payload)
                 self.writer.write(frame)
-                await self.writer.drain()
+                if self.session_pool:
+                    await self.session_pool.record_write(self.session_id, len(frame))
+                await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
+                return True
             except FrameProtocolError as e:
                 logger.error(f"Refusing to send malformed tunnel frame: {e}")
             except Exception:
                 self.connected = False
+                if self.session_pool:
+                    await self.session_pool.mark_unhealthy(self.session_id)
+        return False
 
     async def _allocate_channel_id(self) -> int:
         """Allocate an unused channel id, wrapping safely at 65535."""
@@ -410,7 +470,7 @@ class TunnelClient:
                 break
             try:
                 channel.writer.write(payload)
-                await channel.writer.drain()
+                await self._drain_writer(channel.writer, len(payload), is_data=True)
             except Exception:
                 await self._close_channel(channel)
                 break
@@ -445,7 +505,8 @@ class TunnelClient:
         # Send CONNECT
         try:
             payload = make_connect_payload(host, port)
-            await self.send_frame(FRAME_CONNECT, channel_id, payload)
+            if not await self.send_frame(FRAME_CONNECT, channel_id, payload):
+                raise ConnectionError("Tunnel write failed while opening channel")
             if not self.connected:
                 raise ConnectionError("Tunnel disconnected while opening channel")
         except Exception:
@@ -472,11 +533,11 @@ class TunnelClient:
 
     async def send_data(self, channel_id: int, data: bytes):
         """Send data on channel."""
-        await self.send_frame(FRAME_DATA, channel_id, data)
+        return await self.send_frame(FRAME_DATA, channel_id, data)
 
     async def close_channel_remote(self, channel_id: int):
         """Tell server to close channel."""
-        await self.send_frame(FRAME_CLOSE, channel_id)
+        return await self.send_frame(FRAME_CLOSE, channel_id)
 
     async def _close_channel(self, channel: Channel):
         """Close local channel."""
@@ -520,11 +581,27 @@ class TunnelClient:
 # Reverse Access Node Listener
 # ============================================================================
 
+@dataclass
+class ReverseSessionStats:
+    session_id: int
+    authenticated: bool = True
+    writable: bool = True
+    last_read: float = 0.0
+    last_write: float = 0.0
+    active_channels: int = 0
+    total_channels: int = 0
+    failure_count: int = 0
+    bytes_in: int = 0
+    bytes_out: int = 0
+    connected_since: float = 0.0
+
+
 class ReverseSessionPool:
     """Pool of authenticated reverse tunnel sessions for SOCKS channel routing."""
 
-    def __init__(self):
+    def __init__(self, logging_config: LoggingConfig = None):
         self.sessions: Dict[int, TunnelClient] = {}
+        self.stats: Dict[int, ReverseSessionStats] = {}
         self.channel_to_session: Dict[int, int] = {}
         self.opening_channels: Set[int] = set()
         self.pending_channel_data: Dict[int, List[bytes]] = {}
@@ -532,45 +609,69 @@ class ReverseSessionPool:
         self.next_session_id = 1
         self.next_channel_id = 1
         self.lock = asyncio.Lock()
+        self.logging_config = logging_config or LoggingConfig()
 
     @property
     def connected(self) -> bool:
-        return any(tunnel.connected for tunnel in self.sessions.values())
+        return any(self._is_healthy_locked(session_id, tunnel) for session_id, tunnel in self.sessions.items())
 
     async def add_session(self, tunnel: TunnelClient) -> int:
         async with self.lock:
             session_id = self.next_session_id
             self.next_session_id += 1
             tunnel.session_id = session_id
+            tunnel.session_pool = self
             self.sessions[session_id] = tunnel
-            logger.info(f"Reverse session {session_id} authenticated; active sessions={len(self.sessions)}")
+            now = time.time()
+            self.stats[session_id] = ReverseSessionStats(
+                session_id=session_id,
+                last_read=now,
+                last_write=now,
+                connected_since=now,
+            )
+            if self.logging_config.log_session_events:
+                logger.info(f"Reverse session {session_id} authenticated; active sessions={len(self.sessions)}")
             return session_id
 
     async def remove_session(self, session_id: int):
         async with self.lock:
             tunnel = self.sessions.pop(session_id, None)
+            stat = self.stats.pop(session_id, None)
             dead_channels = [cid for cid, sid in self.channel_to_session.items() if sid == session_id]
             for channel_id in dead_channels:
                 self.channel_to_session.pop(channel_id, None)
                 self.opening_channels.discard(channel_id)
                 self.pending_channel_data.pop(channel_id, None)
                 self.pending_close_channels.discard(channel_id)
-            logger.info(
-                f"Reverse session {session_id} disconnected; "
-                f"closed_channels={len(dead_channels)} active sessions={len(self.sessions)}"
-            )
+            if stat:
+                stat.active_channels = 0
+                stat.writable = False
+            if self.logging_config.log_session_events:
+                logger.info(
+                    f"Reverse session {session_id} disconnected; "
+                    f"closed_channels={len(dead_channels)} active sessions={len(self.sessions)}"
+                )
         if tunnel:
             await tunnel.disconnect()
 
-    def _session_active_count(self, session_id: int) -> int:
-        return sum(1 for sid in self.channel_to_session.values() if sid == session_id)
+    def _is_healthy_locked(self, session_id: int, tunnel: TunnelClient) -> bool:
+        stat = self.stats.get(session_id)
+        writer = getattr(tunnel, 'writer', None)
+        return bool(
+            tunnel
+            and tunnel.connected
+            and stat
+            and stat.authenticated
+            and stat.writable
+            and (writer is None or not writer.is_closing())
+        )
 
     async def choose_session(self) -> Tuple[int, TunnelClient]:
         async with self.lock:
             candidates = [
-                (self._session_active_count(session_id), session_id, tunnel)
+                (self.stats[session_id].active_channels, session_id, tunnel)
                 for session_id, tunnel in self.sessions.items()
-                if tunnel.connected
+                if self._is_healthy_locked(session_id, tunnel)
             ]
             if not candidates:
                 return 0, None
@@ -587,34 +688,91 @@ class ReverseSessionPool:
                 return channel_id
         raise RuntimeError("No free reverse channel ids")
 
-    async def open_channel(self, host: str, port: int) -> Tuple[int, bool]:
-        async with self.lock:
-            candidates = [
-                (self._session_active_count(session_id), session_id, tunnel)
-                for session_id, tunnel in self.sessions.items()
-                if tunnel.connected
-            ]
-            if not candidates:
-                logger.warning(f"No reverse tunnel session available for CONNECT {host}:{port}")
-                return 0, False
-            _, session_id, tunnel = min(candidates, key=lambda item: (item[0], item[1]))
-            try:
-                channel_id = await self._allocate_channel_id_locked()
-            except RuntimeError as e:
-                logger.warning(str(e))
-                return 0, False
-            self.opening_channels.add(channel_id)
-            self.channel_to_session[channel_id] = session_id
+    def _forget_channel_locked(self, channel_id: int):
+        session_id = self.channel_to_session.pop(channel_id, None)
+        if session_id:
+            stat = self.stats.get(session_id)
+            if stat and stat.active_channels > 0:
+                stat.active_channels -= 1
+        self.opening_channels.discard(channel_id)
+        self.pending_channel_data.pop(channel_id, None)
+        self.pending_close_channels.discard(channel_id)
 
-        logger.debug(f"Assigning ch={channel_id} -> reverse session {session_id}")
-        returned_channel_id, success = await tunnel.open_channel(host, port, channel_id=channel_id)
-        if not success:
+    async def mark_unhealthy(self, session_id: int):
+        async with self.lock:
+            stat = self.stats.get(session_id)
+            if stat:
+                stat.writable = False
+                stat.failure_count += 1
+            tunnel = self.sessions.get(session_id)
+            if tunnel:
+                tunnel.connected = False
+
+    async def record_read(self, session_id: int, byte_count: int):
+        async with self.lock:
+            stat = self.stats.get(session_id)
+            if stat:
+                stat.bytes_in += byte_count
+                stat.last_read = time.time()
+
+    async def record_write(self, session_id: int, byte_count: int):
+        async with self.lock:
+            stat = self.stats.get(session_id)
+            if stat:
+                stat.bytes_out += byte_count
+                stat.last_write = time.time()
+
+    async def snapshot(self) -> Tuple[int, List[ReverseSessionStats]]:
+        async with self.lock:
+            return len(self.sessions), [
+                ReverseSessionStats(**vars(stat))
+                for _, stat in sorted(self.stats.items())
+            ]
+
+    async def open_channel(self, host: str, port: int) -> Tuple[int, bool]:
+        for attempt in range(2):
             async with self.lock:
-                self.opening_channels.discard(channel_id)
-                self.channel_to_session.pop(channel_id, None)
-                self.pending_channel_data.pop(channel_id, None)
-                self.pending_close_channels.discard(channel_id)
-        return returned_channel_id, success
+                candidates = [
+                    (self.stats[session_id].active_channels, session_id, tunnel)
+                    for session_id, tunnel in self.sessions.items()
+                    if self._is_healthy_locked(session_id, tunnel)
+                ]
+                if not candidates:
+                    logger.warning("No healthy reverse tunnel session available for CONNECT destination=[redacted]")
+                    return 0, False
+                _, session_id, tunnel = min(candidates, key=lambda item: (item[0], item[1]))
+                try:
+                    channel_id = await self._allocate_channel_id_locked()
+                except RuntimeError as e:
+                    logger.warning(str(e))
+                    return 0, False
+                self.opening_channels.add(channel_id)
+                self.channel_to_session[channel_id] = session_id
+                stat = self.stats[session_id]
+                stat.active_channels += 1
+                stat.total_channels += 1
+                active_count = stat.active_channels
+
+            logger.info(f"Assigned channel {channel_id} to reverse session {session_id} active_channels={active_count}")
+            returned_channel_id, success = await tunnel.open_channel(host, port, channel_id=channel_id)
+            if success:
+                return returned_channel_id, True
+
+            async with self.lock:
+                self._forget_channel_locked(channel_id)
+                session_failed = not self._is_healthy_locked(session_id, tunnel)
+                if session_failed:
+                    stat = self.stats.get(session_id)
+                    if stat:
+                        stat.failure_count += 1
+                        stat.writable = False
+
+            if session_failed and attempt == 0:
+                logger.warning(f"Reverse session {session_id} became unhealthy during CONNECT; retrying another session")
+                continue
+            return returned_channel_id, False
+
+        return 0, False
 
     async def register_channel(self, channel: Channel):
         async with self.lock:
@@ -626,16 +784,23 @@ class ReverseSessionPool:
         else:
             logger.debug(f"Cannot register ch={channel.channel_id}: reverse session unavailable")
             await self._close_writer(channel.writer)
+            async with self.lock:
+                self._forget_channel_locked(channel.channel_id)
 
     async def send_data(self, channel_id: int, data: bytes):
         tunnel = await self._tunnel_for_channel(channel_id)
         if tunnel:
-            await tunnel.send_data(channel_id, data)
+            if not await tunnel.send_data(channel_id, data):
+                await self.mark_unhealthy(getattr(tunnel, 'session_id', 0))
 
     async def close_channel_remote(self, channel_id: int):
         tunnel = await self._tunnel_for_channel(channel_id)
         if tunnel:
             await tunnel.close_channel_remote(channel_id)
+
+    async def cleanup_channel(self, channel_id: int):
+        async with self.lock:
+            self._forget_channel_locked(channel_id)
 
     async def _close_channel(self, channel: Channel):
         tunnel = await self._tunnel_for_channel(channel.channel_id)
@@ -644,10 +809,7 @@ class ReverseSessionPool:
         else:
             await self._close_writer(channel.writer)
         async with self.lock:
-            self.channel_to_session.pop(channel.channel_id, None)
-            self.opening_channels.discard(channel.channel_id)
-            self.pending_channel_data.pop(channel.channel_id, None)
-            self.pending_close_channels.discard(channel.channel_id)
+            self._forget_channel_locked(channel.channel_id)
 
     async def _tunnel_for_channel(self, channel_id: int) -> Optional[TunnelClient]:
         async with self.lock:
@@ -674,14 +836,20 @@ class ReverseAccessListener:
         socks_host: str,
         socks_port: int,
         tunnel_config: TunnelConfig = None,
-        smtp_config: SMTPConfig = None
+        smtp_config: SMTPConfig = None,
+        metrics_config: MetricsConfig = None,
+        logging_config: LoggingConfig = None,
+        transport_config: TransportConfig = None,
     ):
         self.reverse_config = reverse_config
         self.socks_host = socks_host
         self.socks_port = socks_port
         self.tunnel_config = tunnel_config or TunnelConfig()
         self.smtp_config = smtp_config or SMTPConfig()
-        self.session_pool = ReverseSessionPool()
+        self.metrics_config = metrics_config or MetricsConfig()
+        self.logging_config = logging_config or LoggingConfig()
+        self.transport_config = transport_config or TransportConfig()
+        self.session_pool = ReverseSessionPool(self.logging_config)
         self.ssl_context = self._create_ssl_context()
         self.allowed_ips = IPWhitelist(reverse_config.allowed_dialer_ips)
 
@@ -819,10 +987,13 @@ class ReverseAccessListener:
                 ),
                 tunnel_config=self.tunnel_config,
                 smtp_config=self.smtp_config,
+                transport_config=self.transport_config,
+                logging_config=self.logging_config,
             )
             tunnel.reader = reader
             tunnel.writer = writer
             tunnel.connected = True
+            tunnel._apply_socket_options()
             session_id = await self.session_pool.add_session(tunnel)
 
             logger.info(f"Reverse tunnel session {session_id} authenticated: {peer_str}")
@@ -846,7 +1017,7 @@ class ReverseAccessListener:
             logger.info(f"Reverse tunnel session ended: {peer_str}")
 
     async def start(self):
-        socks = SOCKS5Server(self.session_pool, self.socks_host, self.socks_port)
+        socks = SOCKS5Server(self.session_pool, self.socks_host, self.socks_port, self.logging_config)
         socks_server = await asyncio.start_server(
             socks.handle_client,
             socks.host,
@@ -869,11 +1040,41 @@ class ReverseAccessListener:
         else:
             logger.warning("reverse.allowed_dialer_ips is empty; any source IP can attempt TLS/auth")
 
-        async with socks_server, reverse_server:
-            await asyncio.gather(
-                socks_server.serve_forever(),
-                reverse_server.serve_forever(),
-            )
+        metrics_task = asyncio.create_task(self._metrics_loop())
+        try:
+            async with socks_server, reverse_server:
+                await asyncio.gather(
+                    socks_server.serve_forever(),
+                    reverse_server.serve_forever(),
+                )
+        finally:
+            metrics_task.cancel()
+            try:
+                await metrics_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _metrics_loop(self):
+        if not (self.metrics_config.enabled and self.logging_config.log_metrics):
+            return
+        interval = max(1.0, float(self.metrics_config.log_interval or 30.0))
+        while True:
+            await asyncio.sleep(interval)
+            active_sessions, stats = await self.session_pool.snapshot()
+            configured_sessions = max(int(self.tunnel_config.connections or 1), active_sessions)
+            parts = [
+                f"Reverse status: configured_sessions={configured_sessions}",
+                f"active_sessions={active_sessions}",
+            ]
+            for stat in stats:
+                parts.append(
+                    f"session{stat.session_id}_active_channels={stat.active_channels} "
+                    f"session{stat.session_id}_total_channels={stat.total_channels} "
+                    f"session{stat.session_id}_bytes_in={stat.bytes_in} "
+                    f"session{stat.session_id}_bytes_out={stat.bytes_out} "
+                    f"session{stat.session_id}_failures={stat.failure_count}"
+                )
+            logger.info(" ".join(parts))
 
 
 # ============================================================================
@@ -881,11 +1082,18 @@ class ReverseAccessListener:
 # ============================================================================
 
 class SOCKS5Server:
-    def __init__(self, tunnel: TunnelClient, host: str = '127.0.0.1', port: int = 1080):
+    def __init__(
+        self,
+        tunnel: TunnelClient,
+        host: str = '127.0.0.1',
+        port: int = 1080,
+        logging_config: LoggingConfig = None,
+    ):
         self.tunnel = tunnel
         self.host = host
         self.port = port
         self.read_timeout = 30.0
+        self.logging_config = logging_config or LoggingConfig()
 
     async def _read_exact(self, reader: asyncio.StreamReader, size: int) -> bytes:
         return await asyncio.wait_for(reader.readexactly(size), timeout=self.read_timeout)
@@ -950,7 +1158,7 @@ class SOCKS5Server:
                 await self._send_reply(writer, 0x07)
                 return
 
-            logger.info(f"CONNECT {host}:{port}")
+            logger.info(f"CONNECT destination={format_destination(host, port, self.logging_config)}")
 
             # Open tunnel
             channel_id, success = await self.tunnel.open_channel(host, port)
@@ -982,9 +1190,12 @@ class SOCKS5Server:
                 await self.tunnel.close_channel_remote(channel.channel_id)
                 await self.tunnel._close_channel(channel)
             elif 'channel_id' in locals() and channel_id:
-                self.tunnel.opening_channels.discard(channel_id)
-                self.tunnel.pending_channel_data.pop(channel_id, None)
-                self.tunnel.pending_close_channels.discard(channel_id)
+                if hasattr(self.tunnel, 'cleanup_channel'):
+                    await self.tunnel.cleanup_channel(channel_id)
+                else:
+                    self.tunnel.opening_channels.discard(channel_id)
+                    self.tunnel.pending_channel_data.pop(channel_id, None)
+                    self.tunnel.pending_close_channels.discard(channel_id)
             try:
                 writer.close()
                 await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
@@ -1034,11 +1245,15 @@ async def run_client(
     config: ClientConfig,
     ca_cert: str,
     tunnel_config: TunnelConfig = None,
-    smtp_config: SMTPConfig = None
+    smtp_config: SMTPConfig = None,
+    logging_config: LoggingConfig = None,
+    transport_config: TransportConfig = None,
 ):
     """Run client with auto-reconnect."""
     tunnel_config = tunnel_config or TunnelConfig()
     smtp_config = smtp_config or SMTPConfig()
+    logging_config = logging_config or LoggingConfig()
+    transport_config = transport_config or TransportConfig()
 
     reconnect_delay = max(0.1, float(tunnel_config.reconnect_initial_delay or 2.0))
     max_reconnect_delay = max(reconnect_delay, float(tunnel_config.reconnect_max_delay or 30.0))
@@ -1046,7 +1261,7 @@ async def run_client(
     current_delay = reconnect_delay
 
     while True:
-        tunnel = TunnelClient(config, ca_cert, tunnel_config, smtp_config)
+        tunnel = TunnelClient(config, ca_cert, tunnel_config, smtp_config, transport_config, logging_config)
         receiver_task = None
         keepalive_task = None
 
@@ -1064,7 +1279,7 @@ async def run_client(
         keepalive_task = asyncio.create_task(tunnel.keepalive_loop())
 
         # Start SOCKS server
-        socks = SOCKS5Server(tunnel, config.socks_host, config.socks_port)
+        socks = SOCKS5Server(tunnel, config.socks_host, config.socks_port, logging_config)
 
         try:
             # Create SOCKS server but don't block on it
@@ -1114,7 +1329,15 @@ async def run_client(
         current_delay = min(current_delay * 2, max_reconnect_delay)
 
 
-def build_client_settings(config_data: dict, args) -> Tuple[ClientConfig, Optional[str], TunnelConfig, SMTPConfig]:
+def build_client_settings(config_data: dict, args) -> Tuple[
+    ClientConfig,
+    Optional[str],
+    TunnelConfig,
+    SMTPConfig,
+    MetricsConfig,
+    LoggingConfig,
+    TransportConfig,
+]:
     """Build validated client settings from config and CLI overrides."""
     client_conf = (config_data or {}).get('client', {}) or {}
 
@@ -1138,7 +1361,10 @@ def build_client_settings(config_data: dict, args) -> Tuple[ClientConfig, Option
     ca_cert = args.ca_cert or client_conf.get('ca_cert')
     tunnel_config = build_tunnel_config(config_data)
     smtp_config = build_smtp_config(config_data)
-    return config, ca_cert, tunnel_config, smtp_config
+    metrics_config = build_metrics_config(config_data)
+    logging_config = build_logging_config(config_data)
+    transport_config = build_transport_config(config_data)
+    return config, ca_cert, tunnel_config, smtp_config, metrics_config, logging_config, transport_config
 
 
 def check_client_config(config_path: str, args) -> int:
@@ -1149,7 +1375,7 @@ def check_client_config(config_path: str, args) -> int:
     try:
         config_data = load_config(config_path)
         mode = get_client_mode(config_data)
-        config, ca_cert, tunnel_config, smtp_config = build_client_settings(config_data, args)
+        config, ca_cert, tunnel_config, smtp_config, metrics_config, logging_config, transport_config = build_client_settings(config_data, args)
         reverse_config = build_reverse_listen_config(config_data) if mode == MODE_REVERSE_LISTEN else None
     except FileNotFoundError:
         print(f"ERROR: config file not found: {config_path}")
@@ -1208,6 +1434,9 @@ def check_client_config(config_path: str, args) -> int:
     print(f"  SOCKS:  {config.socks_host}:{config.socks_port}")
     print(f"  EHLO:   {smtp_config.ehlo_name}")
     print(f"  Keepalive interval: {tunnel_config.keepalive_interval:g}s")
+    print(f"  Metrics logging: {metrics_config.enabled and logging_config.log_metrics}")
+    print(f"  Log destinations: {logging_config.log_destinations}")
+    print(f"  Read chunk size: {transport_config.read_chunk_size}")
 
     for warning in warnings:
         print(f"WARNING: {warning}")
@@ -1247,7 +1476,7 @@ def main():
 
     try:
         mode = get_client_mode(config_data)
-        config, ca_cert, tunnel_config, smtp_config = build_client_settings(config_data, args)
+        config, ca_cert, tunnel_config, smtp_config, metrics_config, logging_config, transport_config = build_client_settings(config_data, args)
     except Exception as e:
         logger.error(f"Invalid client config: {e}")
         return 1
@@ -1261,6 +1490,9 @@ def main():
                 config.socks_port,
                 tunnel_config,
                 smtp_config,
+                metrics_config,
+                logging_config,
+                transport_config,
             )
         except Exception as e:
             logger.error(f"Invalid reverse-listen config: {e}")
@@ -1280,7 +1512,7 @@ def main():
         return 1
 
     try:
-        return asyncio.run(run_client(config, ca_cert, tunnel_config, smtp_config))
+        return asyncio.run(run_client(config, ca_cert, tunnel_config, smtp_config, logging_config, transport_config))
     except KeyboardInterrupt:
         return 0
 
