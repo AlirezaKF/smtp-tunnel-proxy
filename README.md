@@ -181,9 +181,69 @@ Recommended starting point:
 ```yaml
 tunnel:
   connections: 4
+  connect_timeout: 10
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  tcp_nodelay: true
+  tcp_keepalive: true
 ```
 
 If 4 is worse than 2 or 8 on your specific route, test and use the value that performs best.
+
+Count session distribution on the VPS Exit Node:
+
+```bash
+sudo journalctl -u smtp-tunnel --since "10 minutes ago" --no-pager \
+  | grep -oE '\[reverse session [0-9]+\]' \
+  | sort \
+  | uniq -c
+```
+
+Verify periodic reverse status logs:
+
+```bash
+sudo journalctl -u smtp-tunnel -f | grep -i 'Reverse status'
+```
+
+Lightweight concurrency test:
+
+```bash
+for i in 1 2 3 4 5 6 7 8; do
+  curl -sS --max-time 10 \
+    -x socks5h://127.0.0.1:1080 \
+    -o /dev/null \
+    -w "req$i code:%{http_code} total:%{time_total}\n" \
+    https://ifconfig.me &
+done
+wait
+```
+
+Four-flow throughput test:
+
+```bash
+for i in 1 2 3 4; do
+  curl -sS -L --http1.1 --connect-timeout 10 --max-time 25 \
+    -x socks5h://127.0.0.1:1080 \
+    -o /dev/null \
+    -w "flow$i code:%{http_code} bytes:%{size_download} speed:%{speed_download} total:%{time_total}\n" \
+    "https://speed.cloudflare.com/__down?bytes=50000000" &
+done
+wait
+```
+
+By default, CONNECT destination hostnames and IPs are redacted in logs. Set `logging.log_destinations: true` only for short debug windows when you need full destination visibility.
 
 Let's Encrypt renewal test:
 
