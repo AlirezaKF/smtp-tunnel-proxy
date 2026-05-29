@@ -325,9 +325,13 @@ Optional true reverse mode reverses only the TCP/TLS connection direction:
 `Application / V2Ray -> local SOCKS5 on Access Node -> inbound reverse tunnel from VPS -> Exit Node/VPS -> Internet`
 
 In reverse mode, the Access Node is the TLS server and the Exit Node is the TLS
-client. The active 5-byte binary frame protocol is unchanged. Stage 1 supports
-one active reverse tunnel session. mTLS and multi-session pooling are planned
-as later stages.
+client. The active 5-byte binary frame protocol is unchanged. Stage 2 supports
+multiple independent reverse tunnel sessions using `tunnel.connections`.
+The Access Node assigns each new SOCKS channel to the least-active authenticated
+reverse session. This improves aggregate throughput and concurrent flows on
+links that perform better with parallel streams. A single TCP flow is still
+carried by one tunnel session; single-flow striping is not implemented.
+mTLS remains a separate planned stage.
 
 ### 🔗 CONNECT Payload Format
 
@@ -762,11 +766,14 @@ The tunnel implements these SMTP RFCs during handshake:
 
 ### 📡 Multiplexing
 
-Multiple TCP connections are multiplexed over a single tunnel:
+Multiple TCP connections are multiplexed over tunnel sessions. Normal mode and
+reverse mode with `tunnel.connections: 1` use one tunnel session. Reverse mode
+can run multiple independent tunnel sessions from the VPS Exit Node to the
+Iran-side Access Node:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Single TLS Connection                     │
+│                    One TLS Tunnel Session                    │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  Channel 1: Browser Tab 1 → google.com:443                  │
@@ -774,12 +781,22 @@ Multiple TCP connections are multiplexed over a single tunnel:
 │  Channel 3: curl → ifconfig.me:443                          │
 │  Channel 4: SSH → remote-server:22                          │
 │  ...                                                        │
-│  Channel 65535: Maximum concurrent connections              │
+│  Channel 65535: Maximum channel ID                          │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### 💾 Memory Usage
+
+For reverse mode, a practical starting point is:
+
+```yaml
+tunnel:
+  connections: 4
+```
+
+The best value is network-dependent. Test 2, 4, and 8 sessions before choosing
+a production value.
 
 - **Server:** ~50MB base + ~1MB per active connection
 - **Client:** ~30MB base + ~0.5MB per active channel
@@ -795,6 +812,7 @@ Both client and server use Python's `asyncio` for efficient handling of multiple
 - In normal mode, the server role runs on the outside/VPS host and listens for inbound tunnel sessions.
 - In normal mode, the client role runs beside V2Ray or the application and exposes local SOCKS5.
 - In reverse mode, the Iran-side Access Node runs `client.py` with `client.mode: reverse-listen`; the VPS Exit Node runs `server.py` with `server.mode: reverse-dial`.
+- Reverse mode supports multiple VPS-to-Access tunnel sessions with `tunnel.connections`. New SOCKS channels use least-active-session selection. Existing channels on a failed session fail cleanly and new channels avoid the dead session.
 - Reverse mode requires the Access Node reverse listener port to be reachable from the VPS. NAT/CGNAT requires port forwarding or a different rendezvous/relay design.
 - Reverse mode TLS uses the Access Node certificate. Let's Encrypt HTTP-01, DNS-01/manual, existing certificates, and private CA fallback are installer-supported.
 - `scripts/bootstrap.sh` is the supported GitHub entry point for fresh installs and upgrades. It downloads a selected branch/tag/ref, then delegates to `install.sh`.
