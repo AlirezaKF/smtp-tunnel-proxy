@@ -482,6 +482,8 @@ prompt_secret_if_empty() {
     local var_name="$1"
     local prompt="$2"
     local current_value="${!var_name}"
+    load_secret_from_safe_source
+    current_value="${!var_name}"
     if [ -n "$current_value" ]; then
         return
     fi
@@ -505,6 +507,11 @@ load_secret_from_safe_source() {
             exit 1
         fi
         SECRET_VALUE="$(head -n 1 "$SECRET_FILE")"
+        if [ -z "$SECRET_VALUE" ]; then
+            print_error "Secret file is empty: $SECRET_FILE"
+            exit 1
+        fi
+        chmod 600 "$SECRET_FILE" 2>/dev/null || true
     fi
     if [ -n "$SECRET_ENV" ]; then
         SECRET_VALUE="${!SECRET_ENV:-}"
@@ -593,6 +600,7 @@ prompt_install_options() {
     fi
 
     if [ "$MODE" = "reverse-listen" ]; then
+        load_secret_from_safe_source
         prompt_with_default SOCKS_HOST "Enter local SOCKS bind host" "127.0.0.1"
         prompt_with_default SOCKS_PORT "Enter local SOCKS port" "1080"
         prompt_with_default LISTEN_HOST "Enter reverse listen host" "0.0.0.0"
@@ -618,6 +626,7 @@ prompt_install_options() {
             fi
         fi
     elif [ "$MODE" = "reverse-dial" ]; then
+        load_secret_from_safe_source
         if [ -z "$FROM_REVERSE_PACKAGE" ]; then
             if [ "$CONNECTIONS_SET" -eq 0 ]; then
                 CONNECTIONS="4"
@@ -1018,6 +1027,33 @@ write_reverse_secret_file() {
     chmod 600 "$CONFIG_DIR/reverse.secret"
 }
 
+update_existing_reverse_connections() {
+    local config_path="$1"
+    if [ "$CONNECTIONS_SET" -ne 1 ]; then
+        return 1
+    fi
+    validate_connections_value "$CONNECTIONS"
+    print_step "Updating reverse tunnel sessions in existing config"
+    print_info "Reverse tunnel sessions: $CONNECTIONS"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would set tunnel.connections=$CONNECTIONS in $config_path"
+        return 0
+    fi
+    "$PYTHON_BIN" - "$config_path" "$CONNECTIONS" << 'PY'
+import sys
+import yaml
+
+config_path, connections = sys.argv[1], int(sys.argv[2])
+with open(config_path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+data.setdefault('tunnel', {})['connections'] = connections
+with open(config_path, 'w', encoding='utf-8') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    chmod 600 "$config_path"
+    return 0
+}
+
 install_letsencrypt_renew_hook() {
     if [ "$REVERSE_CERT_MODE" != "letsencrypt" ] && [ "$REVERSE_CERT_MODE" != "letsencrypt-http" ] && [ "$REVERSE_CERT_MODE" != "letsencrypt-dns" ]; then
         return
@@ -1180,6 +1216,23 @@ tunnel:
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
+  connect_timeout: 10
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  tcp_nodelay: true
+  tcp_keepalive: true
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
 
 smtp:
   ehlo_name: "${EHLO_NAME:-$REVERSE_DOMAIN}"
@@ -1236,6 +1289,9 @@ write_reverse_dial_config() {
         CONNECTIONS="4"
     fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if update_existing_reverse_connections "$config_path"; then
+            return
+        fi
         print_info "Existing config preserved: $config_path"
         return
     fi
@@ -1252,6 +1308,7 @@ write_reverse_dial_config() {
 
     prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
     write_reverse_secret_file
+    print_info "Reverse tunnel sessions: $CONNECTIONS"
     if [ "$TLS_VERIFY_MODE" = "private-ca" ]; then
         [ -f "$REVERSE_CA_CERT_SOURCE" ] || { print_error "Reverse CA cert not found: $REVERSE_CA_CERT_SOURCE"; exit 1; }
         ca_path="$CERT_DIR/reverse-ca.crt"
@@ -1294,6 +1351,23 @@ tunnel:
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
+  connect_timeout: 10
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  tcp_nodelay: true
+  tcp_keepalive: true
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
 
 smtp:
   ehlo_name: "${EHLO_NAME:-$SERVER_HOST}"
@@ -1345,6 +1419,23 @@ tunnel:
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
+  connect_timeout: 10
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  tcp_nodelay: true
+  tcp_keepalive: true
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
 EOF
     cat > "$bundle_dir/INSTALL-REVERSE-DIAL.txt" << EOF
 Install on the VPS Exit Node:
