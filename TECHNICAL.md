@@ -837,6 +837,9 @@ logging:
 Transport tuning does not alter the 5-byte frame protocol:
 
 ```yaml
+performance:
+  profile: balanced  # compatibility | balanced | throughput
+
 transport:
   read_chunk_size: 65535
   drain_bytes: 262144
@@ -847,6 +850,11 @@ transport:
   tcp_keepalive: true
   pending_buffer_limit: 1048576
 ```
+
+`performance.profile` only selects defaults for local read sizes, drain cadence,
+and optional socket buffers. Explicit `transport.*` keys override the profile.
+`read_chunk_size` is capped at 65535 because the active frame payload length is
+still a 16-bit field.
 
 - **Server:** ~50MB base + ~1MB per active connection
 - **Client:** ~30MB base + ~0.5MB per active channel
