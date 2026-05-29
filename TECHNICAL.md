@@ -798,6 +798,56 @@ tunnel:
 The best value is network-dependent. Test 2, 4, and 8 sessions before choosing
 a production value.
 
+Stage 2.1 adds explicit health and accounting per reverse session:
+
+- `authenticated`
+- `writable`
+- `last_read`
+- `last_write`
+- `active_channels`
+- `total_channels`
+- `failure_count`
+- `bytes_in`
+- `bytes_out`
+- `connected_since`
+
+Session selection skips unauthenticated, non-writable, closing, or disconnected
+sessions. If a write to the selected session fails while opening a channel, the
+Access Node marks that session unhealthy and retries the channel assignment once
+on another healthy session. If no healthy session exists, the SOCKS CONNECT fails
+quickly.
+
+The Access Node can emit periodic reverse status logs:
+
+```yaml
+metrics:
+  enabled: true
+  log_interval: 30
+```
+
+Destination logging is privacy-safe by default:
+
+```yaml
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
+```
+
+Transport tuning does not alter the 5-byte frame protocol:
+
+```yaml
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
+  tcp_nodelay: true
+  tcp_keepalive: true
+  pending_buffer_limit: 1048576
+```
+
 - **Server:** ~50MB base + ~1MB per active connection
 - **Client:** ~30MB base + ~0.5MB per active channel
 
