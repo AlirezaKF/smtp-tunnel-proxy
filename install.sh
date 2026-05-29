@@ -59,6 +59,8 @@ SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 CONNECTIONS="1"
 CONNECTIONS_SET=0
+PERFORMANCE_PROFILE="balanced"
+PERFORMANCE_PROFILE_SET=0
 HOSTNAME_VALUE=""
 SERVER_HOST=""
 USERNAME_VALUE=""
@@ -139,6 +141,7 @@ Reverse mode options:
   --export-reverse-package     Export VPS reverse-dial bundle from Access Node
   --include-reverse-secret     Include reverse.secret in exported bundle
   --connections N             Reverse tunnel sessions for reverse-dial (fresh reverse default: 4)
+  --performance-profile MODE  compatibility|balanced|throughput (default: balanced)
 
 Upgrade / automation:
   --non-interactive            Do not prompt; fail if required values are missing
@@ -199,6 +202,11 @@ parse_args() {
             --connections)
                 CONNECTIONS="${2:-}"
                 CONNECTIONS_SET=1
+                shift 2
+                ;;
+            --performance-profile)
+                PERFORMANCE_PROFILE="${2:-}"
+                PERFORMANCE_PROFILE_SET=1
                 shift 2
                 ;;
             --username)
@@ -548,6 +556,16 @@ validate_connections_value() {
         print_error "--connections must be an integer >= 1"
         exit 1
     fi
+}
+
+validate_performance_profile() {
+    case "$PERFORMANCE_PROFILE" in
+        compatibility|balanced|throughput) ;;
+        *)
+            print_error "--performance-profile must be compatibility, balanced, or throughput"
+            exit 1
+            ;;
+    esac
 }
 
 check_python_version() {
@@ -953,6 +971,8 @@ preflight_role_values() {
     validate_port_value "$SERVER_PORT" "--server-port"
     validate_port_value "$SOCKS_PORT" "--socks-port"
     validate_connections_value "$CONNECTIONS"
+    validate_performance_profile
+    print_info "Performance profile: $PERFORMANCE_PROFILE"
 
     if [ "$MODE" = "reverse-listen" ]; then
         load_secret_from_safe_source
@@ -1047,6 +1067,59 @@ config_path, connections = sys.argv[1], int(sys.argv[2])
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 data.setdefault('tunnel', {})['connections'] = connections
+with open(config_path, 'w', encoding='utf-8') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    chmod 600 "$config_path"
+    return 0
+}
+
+update_existing_performance_profile() {
+    local config_path="$1"
+    if [ "$PERFORMANCE_PROFILE_SET" -ne 1 ]; then
+        return 1
+    fi
+    validate_performance_profile
+    print_step "Updating performance profile in existing config"
+    print_info "Performance profile: $PERFORMANCE_PROFILE"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would set performance.profile=$PERFORMANCE_PROFILE in $config_path"
+        return 0
+    fi
+    "$PYTHON_BIN" - "$config_path" "$PERFORMANCE_PROFILE" "$CONNECTIONS" "$CONNECTIONS_SET" << 'PY'
+import sys
+import yaml
+
+config_path, profile, connections, connections_set = sys.argv[1:5]
+with open(config_path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+
+data.setdefault('performance', {})['profile'] = profile
+
+tunnel = data.setdefault('tunnel', {})
+tunnel.setdefault('connect_timeout', 10)
+if connections_set == '1':
+    tunnel['connections'] = int(connections)
+
+metrics = data.setdefault('metrics', {})
+metrics.setdefault('enabled', True)
+metrics.setdefault('log_interval', 30)
+
+logging_conf = data.setdefault('logging', {})
+logging_conf.setdefault('log_destinations', False)
+logging_conf.setdefault('log_session_events', True)
+logging_conf.setdefault('log_metrics', True)
+
+transport = data.setdefault('transport', {})
+transport.setdefault('read_chunk_size', 65535)
+transport.setdefault('drain_bytes', 262144)
+transport.setdefault('drain_interval_ms', 10)
+transport.setdefault('socket_send_buffer', 0)
+transport.setdefault('socket_recv_buffer', 0)
+transport.setdefault('tcp_nodelay', True)
+transport.setdefault('tcp_keepalive', True)
+transport.setdefault('pending_buffer_limit', 1048576)
+
 with open(config_path, 'w', encoding='utf-8') as f:
     yaml.safe_dump(data, f, sort_keys=False)
 PY
@@ -1161,6 +1234,9 @@ write_yaml_list_from_words() {
 write_reverse_listen_config() {
     local config_path="$CONFIG_DIR/config.yaml"
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if update_existing_performance_profile "$config_path"; then
+            return
+        fi
         print_info "Existing config preserved: $config_path"
         return
     fi
@@ -1219,7 +1295,7 @@ tunnel:
   connect_timeout: 10
 
 performance:
-  profile: balanced
+  profile: $PERFORMANCE_PROFILE
 
 metrics:
   enabled: true
@@ -1229,8 +1305,11 @@ transport:
   read_chunk_size: 65535
   drain_bytes: 262144
   drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
   tcp_nodelay: true
   tcp_keepalive: true
+  pending_buffer_limit: 1048576
 
 logging:
   log_destinations: false
@@ -1292,6 +1371,9 @@ write_reverse_dial_config() {
         CONNECTIONS="4"
     fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if update_existing_performance_profile "$config_path"; then
+            return
+        fi
         if update_existing_reverse_connections "$config_path"; then
             return
         fi
@@ -1306,6 +1388,7 @@ write_reverse_dial_config() {
     fi
     if [ -n "$FROM_REVERSE_PACKAGE" ]; then
         import_reverse_package "$FROM_REVERSE_PACKAGE"
+        update_existing_performance_profile "$config_path" || true
         return
     fi
 
@@ -1357,7 +1440,7 @@ tunnel:
   connect_timeout: 10
 
 performance:
-  profile: balanced
+  profile: $PERFORMANCE_PROFILE
 
 metrics:
   enabled: true
@@ -1367,8 +1450,11 @@ transport:
   read_chunk_size: 65535
   drain_bytes: 262144
   drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
   tcp_nodelay: true
   tcp_keepalive: true
+  pending_buffer_limit: 1048576
 
 logging:
   log_destinations: false
@@ -1428,7 +1514,7 @@ tunnel:
   connect_timeout: 10
 
 performance:
-  profile: balanced
+  profile: $PERFORMANCE_PROFILE
 
 metrics:
   enabled: true
@@ -1438,8 +1524,11 @@ transport:
   read_chunk_size: 65535
   drain_bytes: 262144
   drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
   tcp_nodelay: true
   tcp_keepalive: true
+  pending_buffer_limit: 1048576
 
 logging:
   log_destinations: false
@@ -1467,6 +1556,9 @@ write_server_config() {
     local config_path="$CONFIG_DIR/config.yaml"
 
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if update_existing_performance_profile "$config_path"; then
+            return
+        fi
         print_info "Existing config preserved: $config_path"
         return
     fi
@@ -1517,6 +1609,29 @@ tunnel:
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
+  connect_timeout: 10
+
+performance:
+  profile: $PERFORMANCE_PROFILE
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
+  tcp_nodelay: true
+  tcp_keepalive: true
+  pending_buffer_limit: 1048576
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
 
 smtp:
   ehlo_name: "$EHLO_NAME"
@@ -1597,6 +1712,9 @@ write_client_config() {
     local ca_will_be_installed=0
 
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if update_existing_performance_profile "$config_path"; then
+            return
+        fi
         print_info "Existing config preserved: $config_path"
         return
     fi
@@ -1610,6 +1728,7 @@ write_client_config() {
 
     if [ -n "$FROM_PACKAGE" ]; then
         import_client_package "$FROM_PACKAGE"
+        update_existing_performance_profile "$config_path" || true
         return
     fi
 
@@ -1716,6 +1835,29 @@ tunnel:
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
+  connect_timeout: 10
+
+performance:
+  profile: $PERFORMANCE_PROFILE
+
+metrics:
+  enabled: true
+  log_interval: 30
+
+transport:
+  read_chunk_size: 65535
+  drain_bytes: 262144
+  drain_interval_ms: 10
+  socket_send_buffer: 0
+  socket_recv_buffer: 0
+  tcp_nodelay: true
+  tcp_keepalive: true
+  pending_buffer_limit: 1048576
+
+logging:
+  log_destinations: false
+  log_session_events: true
+  log_metrics: true
 
 smtp:
   ehlo_name: "$EHLO_NAME"
