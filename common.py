@@ -946,6 +946,35 @@ class TunnelConfig:
     reconnect_max_delay: float = 30.0
     reconnect_jitter: float = 0.2
     connections: int = 1
+    connect_timeout: float = 10.0
+
+
+@dataclass
+class MetricsConfig:
+    """Runtime diagnostics for reverse sessions."""
+    enabled: bool = True
+    log_interval: float = 30.0
+
+
+@dataclass
+class LoggingConfig:
+    """Privacy and event logging behavior."""
+    log_destinations: bool = False
+    log_session_events: bool = True
+    log_metrics: bool = True
+
+
+@dataclass
+class TransportConfig:
+    """Transport buffering and socket tuning."""
+    read_chunk_size: int = 65535
+    drain_bytes: int = 262144
+    drain_interval_ms: int = 10
+    socket_send_buffer: int = 0
+    socket_recv_buffer: int = 0
+    tcp_nodelay: bool = True
+    tcp_keepalive: bool = True
+    pending_buffer_limit: int = 1048576
 
 
 @dataclass
@@ -1099,6 +1128,13 @@ def _as_int(value, default: int, name: str, minimum: int = None, maximum: int = 
     return parsed
 
 
+def _as_optional_int(value, default: int, name: str, minimum: int = None, maximum: int = None) -> int:
+    """Parse an optional integer config value. 0 disables optional settings."""
+    if value is None:
+        return default
+    return _as_int(value, default, name, minimum, maximum)
+
+
 def _as_str_list(value, name: str) -> List[str]:
     """Parse a list of strings."""
     if value is None:
@@ -1189,10 +1225,92 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
             tunnel_conf.get('connections'), 1,
             'tunnel.connections', minimum=1
         ),
+        connect_timeout=_as_float(
+            tunnel_conf.get('connect_timeout'), 10.0,
+            'tunnel.connect_timeout', minimum=0.1
+        ),
     )
     if config.reconnect_max_delay < config.reconnect_initial_delay:
         raise ValueError("tunnel.reconnect_max_delay must be >= tunnel.reconnect_initial_delay")
     return config
+
+
+def build_metrics_config(config_data: dict) -> MetricsConfig:
+    """Build metrics logging config with production-safe defaults."""
+    metrics_conf = (config_data or {}).get('metrics', {}) or {}
+    return MetricsConfig(
+        enabled=_as_bool(metrics_conf.get('enabled'), True, 'metrics.enabled'),
+        log_interval=_as_float(
+            metrics_conf.get('log_interval'), 30.0,
+            'metrics.log_interval', minimum=1.0
+        ),
+    )
+
+
+def build_logging_config(config_data: dict) -> LoggingConfig:
+    """Build privacy/event logging config."""
+    logging_conf = (config_data or {}).get('logging', {}) or {}
+    return LoggingConfig(
+        log_destinations=_as_bool(
+            logging_conf.get('log_destinations'), False,
+            'logging.log_destinations'
+        ),
+        log_session_events=_as_bool(
+            logging_conf.get('log_session_events'), True,
+            'logging.log_session_events'
+        ),
+        log_metrics=_as_bool(
+            logging_conf.get('log_metrics'), True,
+            'logging.log_metrics'
+        ),
+    )
+
+
+def build_transport_config(config_data: dict) -> TransportConfig:
+    """Build transport tuning config without changing the wire protocol."""
+    transport_conf = (config_data or {}).get('transport', {}) or {}
+    return TransportConfig(
+        read_chunk_size=_as_int(
+            transport_conf.get('read_chunk_size'), 65535,
+            'transport.read_chunk_size', minimum=1024, maximum=65535
+        ),
+        drain_bytes=_as_int(
+            transport_conf.get('drain_bytes'), 262144,
+            'transport.drain_bytes', minimum=1
+        ),
+        drain_interval_ms=_as_int(
+            transport_conf.get('drain_interval_ms'), 10,
+            'transport.drain_interval_ms', minimum=0
+        ),
+        socket_send_buffer=_as_optional_int(
+            transport_conf.get('socket_send_buffer'), 0,
+            'transport.socket_send_buffer', minimum=0
+        ),
+        socket_recv_buffer=_as_optional_int(
+            transport_conf.get('socket_recv_buffer'), 0,
+            'transport.socket_recv_buffer', minimum=0
+        ),
+        tcp_nodelay=_as_bool(
+            transport_conf.get('tcp_nodelay'), True,
+            'transport.tcp_nodelay'
+        ),
+        tcp_keepalive=_as_bool(
+            transport_conf.get('tcp_keepalive'), True,
+            'transport.tcp_keepalive'
+        ),
+        pending_buffer_limit=_as_int(
+            transport_conf.get('pending_buffer_limit'), 1048576,
+            'transport.pending_buffer_limit', minimum=65536
+        ),
+    )
+
+
+def format_destination(host: str, port: int, logging_config: LoggingConfig = None) -> str:
+    """Return a destination string, redacting host/IP by default."""
+    logging_config = logging_config or LoggingConfig()
+    if logging_config.log_destinations:
+        return f"{host}:{port}"
+    return "[redacted]"
 
 
 def get_client_mode(config_data: dict) -> str:
