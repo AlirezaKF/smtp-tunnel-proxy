@@ -20,6 +20,8 @@ import ssl
 import logging
 import argparse
 import os
+import random
+import time
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
@@ -34,15 +36,21 @@ from common import (
     FRAME_KEEPALIVE,
     FRAME_KEEPALIVE_ACK,
     FrameProtocolError,
+    MODE_NORMAL,
+    MODE_REVERSE_DIAL,
+    ReverseDialConfig,
     TunnelConfig,
     TunnelCrypto,
+    build_reverse_dial_config,
     build_tunnel_config,
     encode_frame,
+    get_server_mode,
     load_config,
     load_users,
     parse_connect_payload,
     ServerConfig,
     UserConfig,
+    verify_peer_fingerprint,
     validate_tcp_port,
     IPWhitelist,
 )
@@ -472,6 +480,320 @@ class TunnelServer:
             await server.serve_forever()
 
 
+# ============================================================================
+# Reverse Dialer - Exit Node
+# ============================================================================
+
+class ReverseExitSession:
+    """Binary frame handler for a reverse-dial tunnel session."""
+
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        reverse_config: ReverseDialConfig,
+        tunnel_config: TunnelConfig = None,
+    ):
+        self.reader = reader
+        self.writer = writer
+        self.reverse_config = reverse_config
+        self.tunnel_config = tunnel_config or TunnelConfig()
+        self.channels: Dict[int, Channel] = {}
+        self.channel_tasks: Dict[int, asyncio.Task] = {}
+        self.write_lock = asyncio.Lock()
+        self.keepalive_ack_event = asyncio.Event()
+        self.connected = True
+
+    async def run(self):
+        frame_buffer = ActiveFrameBuffer()
+        try:
+            while self.connected:
+                try:
+                    chunk = await asyncio.wait_for(self.reader.read(65536), timeout=60.0)
+                    if not chunk:
+                        break
+                    frame_buffer.append(chunk)
+                    for frame in frame_buffer.get_frames():
+                        await self._handle_frame(frame.frame_type, frame.channel_id, frame.payload)
+                except asyncio.TimeoutError:
+                    if self.writer.is_closing():
+                        break
+                    continue
+                except FrameProtocolError as e:
+                    logger.warning(f"Malformed reverse tunnel frame: {e}")
+                    break
+        finally:
+            self.connected = False
+            await self._cleanup()
+
+    async def _handle_frame(self, frame_type: int, channel_id: int, payload: bytes):
+        if frame_type == FRAME_CONNECT:
+            await self._handle_connect(channel_id, payload)
+        elif frame_type == FRAME_DATA:
+            await self._handle_data(channel_id, payload)
+        elif frame_type == FRAME_CLOSE:
+            await self._handle_close(channel_id)
+        elif frame_type == FRAME_KEEPALIVE:
+            await self._send_frame(FRAME_KEEPALIVE_ACK, CONTROL_CHANNEL_ID)
+        elif frame_type == FRAME_KEEPALIVE_ACK:
+            self.keepalive_ack_event.set()
+
+    async def _handle_connect(self, channel_id: int, payload: bytes):
+        try:
+            host, port = parse_connect_payload(payload)
+            logger.info(f"[reverse] CONNECT ch={channel_id} -> {host}:{port}")
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port),
+                    timeout=30.0
+                )
+                channel = Channel(
+                    channel_id=channel_id,
+                    host=host,
+                    port=port,
+                    reader=reader,
+                    writer=writer,
+                    connected=True,
+                )
+                self.channels[channel_id] = channel
+                await self._send_frame(FRAME_CONNECT_OK, channel_id)
+                self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
+            except Exception as e:
+                logger.warning(f"[reverse] Connect failed ch={channel_id}: {e}")
+                await self._send_frame(FRAME_CONNECT_FAIL, channel_id, str(e).encode()[:100])
+        except FrameProtocolError as e:
+            logger.warning(f"[reverse] Invalid CONNECT ch={channel_id}: {e}")
+            await self._send_frame(FRAME_CONNECT_FAIL, channel_id)
+
+    async def _handle_data(self, channel_id: int, payload: bytes):
+        channel = self.channels.get(channel_id)
+        if channel and channel.connected and channel.writer:
+            try:
+                channel.writer.write(payload)
+                await channel.writer.drain()
+            except Exception:
+                await self._close_channel(channel)
+        else:
+            logger.debug(f"[reverse] Dropping DATA for unknown ch={channel_id}")
+
+    async def _handle_close(self, channel_id: int):
+        channel = self.channels.get(channel_id)
+        if channel:
+            await self._close_channel(channel)
+
+    async def _channel_reader(self, channel: Channel):
+        try:
+            while channel.connected and self.connected:
+                data = await channel.reader.read(32768)
+                if not data:
+                    break
+                await self._send_frame(FRAME_DATA, channel.channel_id, data)
+        except Exception as e:
+            logger.debug(f"[reverse] Channel reader error: {e}")
+        finally:
+            self.channel_tasks.pop(channel.channel_id, None)
+            if channel.connected:
+                await self._send_frame(FRAME_CLOSE, channel.channel_id)
+                await self._close_channel(channel)
+
+    async def _send_frame(self, frame_type: int, channel_id: int, payload: bytes = b''):
+        if self.writer.is_closing():
+            return
+        try:
+            async with self.write_lock:
+                self.writer.write(encode_frame(frame_type, channel_id, payload))
+                await self.writer.drain()
+        except FrameProtocolError as e:
+            logger.error(f"[reverse] Refusing malformed frame: {e}")
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self.connected = False
+
+    async def _close_channel(self, channel: Channel):
+        if not channel.connected:
+            return
+        channel.connected = False
+        if channel.writer:
+            try:
+                channel.writer.close()
+                await asyncio.wait_for(channel.writer.wait_closed(), timeout=5.0)
+            except Exception:
+                pass
+        self.channels.pop(channel.channel_id, None)
+        logger.debug(f"[reverse] Closed ch={channel.channel_id}")
+
+    async def _cleanup(self):
+        for channel in list(self.channels.values()):
+            await self._close_channel(channel)
+        for task in list(self.channel_tasks.values()):
+            task.cancel()
+        for task in list(self.channel_tasks.values()):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.channel_tasks.clear()
+        try:
+            self.writer.close()
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=5.0)
+        except Exception:
+            pass
+
+
+class ReverseDialer:
+    """Exit Node dialer for reverse mode."""
+
+    def __init__(self, reverse_config: ReverseDialConfig, tunnel_config: TunnelConfig = None):
+        self.reverse_config = reverse_config
+        self.tunnel_config = tunnel_config or TunnelConfig()
+
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        tls = self.reverse_config.tls
+        if tls.verify_mode == 'fingerprint':
+            logger.warning("Using reverse TLS fingerprint pinning; CA verification is replaced by explicit fingerprint check")
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            if tls.verify_mode == 'private-ca':
+                if not tls.ca_cert:
+                    raise ValueError("server.reverse.tls.ca_cert is required for private-ca verification")
+                ctx.load_verify_locations(tls.ca_cert)
+
+        if self.reverse_config.mtls.enabled:
+            raise ValueError("reverse mTLS is planned for Stage 1b and is not implemented in Stage 1")
+
+        return ctx
+
+    async def _send_line(self, writer: asyncio.StreamWriter, line: str):
+        writer.write(f"{line}\r\n".encode())
+        await writer.drain()
+
+    async def _read_line(self, reader: asyncio.StreamReader) -> Optional[str]:
+        try:
+            data = await asyncio.wait_for(reader.readline(), timeout=60.0)
+            if not data:
+                return None
+            return data.decode('utf-8', errors='replace').strip()
+        except Exception:
+            return None
+
+    async def _expect_250(self, reader: asyncio.StreamReader) -> bool:
+        while True:
+            line = await self._read_line(reader)
+            if not line:
+                return False
+            if line.startswith('250 '):
+                return True
+            if line.startswith('250-'):
+                continue
+            return False
+
+    async def _upgrade_tls(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        ssl_context: ssl.SSLContext,
+    ):
+        transport = writer.transport
+        protocol = writer._protocol
+        loop = asyncio.get_event_loop()
+        server_name = self.reverse_config.tls_server_name or self.reverse_config.access_host
+
+        new_transport = await loop.start_tls(
+            transport,
+            protocol,
+            ssl_context,
+            server_hostname=server_name,
+        )
+        writer._transport = new_transport
+        reader._transport = new_transport
+
+        if self.reverse_config.tls.verify_mode == 'fingerprint':
+            ssl_object = writer.get_extra_info('ssl_object')
+            if not verify_peer_fingerprint(ssl_object, self.reverse_config.tls.cert_fingerprint_sha256):
+                raise ssl.SSLError("reverse TLS certificate fingerprint mismatch")
+
+    async def _smtp_handshake(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
+        line = await self._read_line(reader)
+        if not line or not line.startswith('220'):
+            return False
+
+        await self._send_line(writer, f"EHLO {self.reverse_config.tls_server_name or self.reverse_config.access_host}")
+        if not await self._expect_250(reader):
+            return False
+
+        await self._send_line(writer, "STARTTLS")
+        line = await self._read_line(reader)
+        if not line or not line.startswith('220'):
+            return False
+
+        await self._upgrade_tls(reader, writer, self._create_ssl_context())
+
+        await self._send_line(writer, f"EHLO {self.reverse_config.tls_server_name or self.reverse_config.access_host}")
+        if not await self._expect_250(reader):
+            return False
+
+        token = TunnelCrypto(self.reverse_config.auth_secret, is_server=False).generate_auth_token(
+            int(time.time()),
+            self.reverse_config.auth_username,
+        )
+        await self._send_line(writer, f"AUTH PLAIN {token}")
+        line = await self._read_line(reader)
+        if not line or not line.startswith('235'):
+            logger.warning("Reverse authentication rejected by Access Node")
+            return False
+
+        await self._send_line(writer, "BINARY")
+        line = await self._read_line(reader)
+        if not line or not line.startswith('299'):
+            return False
+        return True
+
+    async def connect_once(self):
+        logger.info(f"Reverse dialing {self.reverse_config.access_host}:{self.reverse_config.access_port}")
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.reverse_config.access_host, self.reverse_config.access_port),
+            timeout=30.0,
+        )
+        try:
+            if not await self._smtp_handshake(reader, writer):
+                raise ConnectionError("reverse SMTP/TLS/auth handshake failed")
+            logger.info("Reverse tunnel established")
+            session = ReverseExitSession(reader, writer, self.reverse_config, self.tunnel_config)
+            await session.run()
+        finally:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
+            except Exception:
+                pass
+
+    async def run_forever(self):
+        initial = max(0.1, float(self.tunnel_config.reconnect_initial_delay or 2.0))
+        max_delay = max(initial, float(self.tunnel_config.reconnect_max_delay or 30.0))
+        jitter = max(0.0, float(self.tunnel_config.reconnect_jitter or 0.0))
+        delay = initial
+
+        while True:
+            try:
+                await self.connect_once()
+                delay = initial
+                logger.warning("Reverse tunnel disconnected")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Reverse dial failed: {e}")
+
+            spread = delay * jitter
+            sleep_for = max(0.0, delay + random.uniform(-spread, spread))
+            logger.info(f"Reverse reconnect in {sleep_for:.1f}s")
+            await asyncio.sleep(sleep_for)
+            delay = min(delay * 2, max_delay)
+
+
 def build_server_settings(config_data: dict, args) -> Tuple[ServerConfig, TunnelConfig, str]:
     """Build validated server settings from config and CLI overrides."""
     server_conf = (config_data or {}).get('server', {}) or {}
@@ -497,7 +819,9 @@ def check_server_config(config_path: str, args) -> int:
 
     try:
         config_data = load_config(config_path)
+        mode = get_server_mode(config_data)
         config, tunnel_config, users_file = build_server_settings(config_data, args)
+        reverse_config = build_reverse_dial_config(config_data) if mode == MODE_REVERSE_DIAL else None
     except FileNotFoundError:
         print(f"ERROR: config file not found: {config_path}")
         return 1
@@ -505,35 +829,61 @@ def check_server_config(config_path: str, args) -> int:
         print(f"ERROR: invalid server config: {e}")
         return 1
 
-    if not config.host:
-        errors.append("server.host is required")
-    if not config.hostname:
-        errors.append("server.hostname is required")
+    users = {}
+    if mode == MODE_NORMAL:
+        if not config.host:
+            errors.append("server.host is required")
+        if not config.hostname:
+            errors.append("server.hostname is required")
 
-    for label, path in (
-        ("server.cert_file", config.cert_file),
-        ("server.key_file", config.key_file),
-        ("server.users_file", users_file),
-    ):
-        if not path:
-            errors.append(f"{label} is required")
-        elif not os.path.exists(path):
-            errors.append(f"{label} does not exist: {path}")
-        elif not os.path.isfile(path):
-            errors.append(f"{label} is not a file: {path}")
+        for label, path in (
+            ("server.cert_file", config.cert_file),
+            ("server.key_file", config.key_file),
+            ("server.users_file", users_file),
+        ):
+            if not path:
+                errors.append(f"{label} is required")
+            elif not os.path.exists(path):
+                errors.append(f"{label} does not exist: {path}")
+            elif not os.path.isfile(path):
+                errors.append(f"{label} is not a file: {path}")
 
-    users = load_users(users_file) if os.path.exists(users_file) else {}
-    if not users:
-        warnings.append("users file contains no users; all authentication attempts will fail")
+        users = load_users(users_file) if os.path.exists(users_file) else {}
+        if not users:
+            warnings.append("users file contains no users; all authentication attempts will fail")
+    else:
+        if not reverse_config.access_host:
+            errors.append("server.reverse.access_host is required")
+        if not reverse_config.tls_server_name:
+            errors.append("server.reverse.tls_server_name is required")
+        if not reverse_config.auth_username:
+            errors.append("server.reverse.auth_username is required")
+        if not reverse_config.auth_secret:
+            errors.append("server.reverse.auth_secret or auth_secret_file is required")
+        if reverse_config.tls.verify_mode == 'private-ca':
+            if not reverse_config.tls.ca_cert:
+                errors.append("server.reverse.tls.ca_cert is required for private-ca verification")
+            elif not os.path.isfile(reverse_config.tls.ca_cert):
+                errors.append(f"server.reverse.tls.ca_cert does not exist: {reverse_config.tls.ca_cert}")
+        if reverse_config.tls.verify_mode == 'fingerprint' and not reverse_config.tls.cert_fingerprint_sha256:
+            errors.append("server.reverse.tls.cert_fingerprint_sha256 is required for fingerprint verification")
+        if reverse_config.mtls.enabled:
+            errors.append("reverse mTLS is planned for Stage 1b and is not implemented in Stage 1")
 
     print("Server config check")
     print(f"  Config: {config_path}")
-    print(f"  Listen: {config.host}:{config.port}")
-    print(f"  Hostname: {config.hostname}")
-    print(f"  Cert: {config.cert_file}")
-    print(f"  Key: {config.key_file}")
-    print(f"  Users: {users_file} ({len(users)} loaded)")
-    print("  Keepalive response: enabled when client sends keepalive frames")
+    print(f"  Mode: {mode}")
+    if mode == MODE_NORMAL:
+        print(f"  Listen: {config.host}:{config.port}")
+        print(f"  Hostname: {config.hostname}")
+        print(f"  Cert: {config.cert_file}")
+        print(f"  Key: {config.key_file}")
+        print(f"  Users: {users_file} ({len(users)} loaded)")
+        print("  Keepalive response: enabled when client sends keepalive frames")
+    else:
+        print(f"  Reverse target: {reverse_config.access_host}:{reverse_config.access_port}")
+        print(f"  TLS server name: {reverse_config.tls_server_name}")
+        print(f"  TLS verify mode: {reverse_config.tls.verify_mode}")
     print(f"  Configured keepalive interval for generated/shared configs: {tunnel_config.keepalive_interval:g}s")
 
     for warning in warnings:
@@ -568,10 +918,23 @@ def main():
         return check_server_config(args.config, args)
 
     try:
+        mode = get_server_mode(config_data)
         config, tunnel_config, users_file = build_server_settings(config_data, args)
     except Exception as e:
         logger.error(f"Invalid server config: {e}")
         return 1
+
+    if mode == MODE_REVERSE_DIAL:
+        try:
+            reverse_config = build_reverse_dial_config(config_data)
+            dialer = ReverseDialer(reverse_config, tunnel_config)
+            asyncio.run(dialer.run_forever())
+        except KeyboardInterrupt:
+            logger.info("Reverse dialer stopped")
+        except Exception as e:
+            logger.error(f"Invalid reverse-dial config: {e}")
+            return 1
+        return 0
 
     # Load users file (command line override or from config)
     if not os.path.exists(users_file):
