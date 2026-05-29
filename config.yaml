@@ -78,6 +78,52 @@ smtp:
   ehlo_name: "client.local"
 
 # ============================================================================
+# Reverse Mode Examples - Optional
+# ============================================================================
+# Normal mode remains the default. To enable true reverse mode:
+#
+# Access Node / Iran-side (client.py):
+#
+# client:
+#   mode: reverse-listen
+#   socks_host: "127.0.0.1"
+#   socks_port: 1080
+#   reverse:
+#     listen_host: "0.0.0.0"
+#     listen_port: 587
+#     auth_username: "reverse1"
+#     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
+#     allowed_dialer_ips:
+#       - "VPS_PUBLIC_IP"
+#     tls:
+#       cert_mode: "letsencrypt"   # letsencrypt | existing | private-ca
+#       domain: "access.example.com"
+#       cert_file: "/etc/letsencrypt/live/access.example.com/fullchain.pem"
+#       key_file: "/etc/letsencrypt/live/access.example.com/privkey.pem"
+#       letsencrypt_email: "admin@example.com"
+#       letsencrypt_challenge: "http-01"  # http-01 | dns-01 | manual
+#       auto_renew: true
+#     mtls:
+#       enabled: false  # planned for Stage 1b
+#
+# Exit Node / VPS (server.py):
+#
+# server:
+#   mode: reverse-dial
+#   reverse:
+#     access_host: "access.example.com"
+#     access_port: 587
+#     tls_server_name: "access.example.com"
+#     auth_username: "reverse1"
+#     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
+#     tls:
+#       verify_mode: "system-ca"  # system-ca | private-ca | fingerprint
+#       ca_cert: null
+#       cert_fingerprint_sha256: null
+#     mtls:
+#       enabled: false  # planned for Stage 1b
+
+# ============================================================================
 # Stealth Configuration (DPI Evasion) - Optional
 # ============================================================================
 stealth:
