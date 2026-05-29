@@ -80,6 +80,12 @@ tunnel:
 # ============================================================================
 # Metrics, Logging Privacy, and Transport Tuning - Optional
 # ============================================================================
+performance:
+  # compatibility: upstream-like conservative reads/drains.
+  # balanced: production default.
+  # throughput: larger buffers and less frequent DATA drain calls.
+  profile: balanced
+
 metrics:
   # Reverse status logs are useful while tuning multi-session reverse mode.
   enabled: true
