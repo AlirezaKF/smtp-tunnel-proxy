@@ -57,6 +57,8 @@ LISTEN_PORT="587"
 SERVER_PORT="587"
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
+CONNECTIONS="1"
+CONNECTIONS_SET=0
 HOSTNAME_VALUE=""
 SERVER_HOST=""
 USERNAME_VALUE=""
@@ -136,6 +138,7 @@ Reverse mode options:
   --from-reverse-package PATH  Install VPS reverse-dial config from bundle
   --export-reverse-package     Export VPS reverse-dial bundle from Access Node
   --include-reverse-secret     Include reverse.secret in exported bundle
+  --connections N             Reverse tunnel sessions for reverse-dial (fresh reverse default: 4)
 
 Upgrade / automation:
   --non-interactive            Do not prompt; fail if required values are missing
@@ -191,6 +194,11 @@ parse_args() {
                 ;;
             --socks-port)
                 SOCKS_PORT="${2:-}"
+                shift 2
+                ;;
+            --connections)
+                CONNECTIONS="${2:-}"
+                CONNECTIONS_SET=1
                 shift 2
                 ;;
             --username)
@@ -527,6 +535,14 @@ validate_port_value() {
     fi
 }
 
+validate_connections_value() {
+    local value="$1"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
+        print_error "--connections must be an integer >= 1"
+        exit 1
+    fi
+}
+
 check_python_version() {
     if ! command -v python3 >/dev/null 2>&1; then
         print_error "Python 3 not found"
@@ -603,6 +619,9 @@ prompt_install_options() {
         fi
     elif [ "$MODE" = "reverse-dial" ]; then
         if [ -z "$FROM_REVERSE_PACKAGE" ]; then
+            if [ "$CONNECTIONS_SET" -eq 0 ]; then
+                CONNECTIONS="4"
+            fi
             prompt_if_empty SERVER_HOST "Enter Access Node reverse host/domain:"
             prompt_with_default SERVER_PORT "Enter Access Node reverse port" "587"
             if [ -z "$REVERSE_DOMAIN" ]; then
@@ -617,6 +636,7 @@ prompt_install_options() {
             fi
             prompt_if_empty USERNAME_VALUE "Enter reverse auth username:"
             prompt_secret_if_empty SECRET_VALUE "Enter reverse auth secret (input hidden):"
+            prompt_with_default CONNECTIONS "Enter reverse tunnel session count" "$CONNECTIONS"
         fi
     elif [ "$ROLE" = "server" ]; then
         prompt_with_default LISTEN_HOST "Enter server listen host" "0.0.0.0"
@@ -923,6 +943,7 @@ preflight_role_values() {
     validate_port_value "$LISTEN_PORT" "--listen-port"
     validate_port_value "$SERVER_PORT" "--server-port"
     validate_port_value "$SOCKS_PORT" "--socks-port"
+    validate_connections_value "$CONNECTIONS"
 
     if [ "$MODE" = "reverse-listen" ]; then
         load_secret_from_safe_source
@@ -1211,6 +1232,9 @@ PY
 write_reverse_dial_config() {
     local config_path="$CONFIG_DIR/config.yaml"
     local ca_path=""
+    if [ "$CONNECTIONS_SET" -eq 0 ]; then
+        CONNECTIONS="4"
+    fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
         print_info "Existing config preserved: $config_path"
         return
@@ -1264,7 +1288,7 @@ server:
       enabled: false
 
 tunnel:
-  connections: 1
+  connections: $CONNECTIONS
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
@@ -1315,7 +1339,7 @@ $ca_line
       enabled: false
 
 tunnel:
-  connections: 1
+  connections: 4
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
