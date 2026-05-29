@@ -1218,6 +1218,9 @@ tunnel:
   reconnect_jitter: 0.35
   connect_timeout: 10
 
+performance:
+  profile: balanced
+
 metrics:
   enabled: true
   log_interval: 30
@@ -1353,6 +1356,9 @@ tunnel:
   reconnect_jitter: 0.35
   connect_timeout: 10
 
+performance:
+  profile: balanced
+
 metrics:
   enabled: true
   log_interval: 30
@@ -1420,6 +1426,9 @@ tunnel:
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
   connect_timeout: 10
+
+performance:
+  profile: balanced
 
 metrics:
   enabled: true
