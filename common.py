@@ -1187,7 +1187,7 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
         ),
         connections=_as_int(
             tunnel_conf.get('connections'), 1,
-            'tunnel.connections', minimum=1, maximum=64
+            'tunnel.connections', minimum=1
         ),
     )
     if config.reconnect_max_delay < config.reconnect_initial_delay:
