@@ -2,7 +2,7 @@
 
 SMTP Tunnel Proxy is a TCP tunnel with a local SOCKS5 listener. It carries client/server traffic through an SMTP-like / STARTTLS connection.
 
-Default architecture:
+Default normal architecture:
 
 ```text
 V2Ray / Application
@@ -22,7 +22,25 @@ VPS server on port 587
 Internet
 ```
 
-This version **does not implement reverse mode**. The foreign VPS does not dial into the client. The current mode is outbound from the client to the VPS, with multiple SOCKS5 connections multiplexed over the same tunnel session.
+Normal mode remains the default and is backward compatible. This version also supports optional true reverse mode:
+
+```text
+V2Ray / Application
+        |
+        v
+Access Node in Iran
+local SOCKS5 127.0.0.1:1080
+reverse listener on port 587
+        ^
+        |
+Exit Node on foreign VPS dials inward
+SMTP-like handshake + STARTTLS + auth + binary frames
+        |
+        v
+Internet exit from VPS
+```
+
+In reverse mode the Iran-side Access Node is the TLS server and needs the certificate/key. The VPS Exit Node is the TLS client and must verify the Access Node certificate.
 
 > No tunnel can guarantee that it will never be detected or blocked by DPI/firewall systems. This project aims to improve stability, configurability, and remove obvious static fingerprints, but detection is still possible.
 
@@ -88,6 +106,77 @@ Ubuntu/Debian Linux
 root or sudo access
 A free local SOCKS port, usually 127.0.0.1:1080
 ```
+
+For reverse mode, the Iran-side Access Node must also have an inbound TCP port reachable from the VPS. If the Access Node is behind NAT/CGNAT, true reverse mode requires port forwarding or another rendezvous design.
+
+---
+
+# Reverse Mode Quick Install
+
+Iran-side Access Node with Let's Encrypt HTTP-01:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/bootstrap.sh | sudo bash -s -- \
+  --role client \
+  --mode reverse-listen \
+  --repo GITHUB_USER/REPO_NAME \
+  --ref main \
+  --socks-host 127.0.0.1 \
+  --socks-port 1080 \
+  --reverse-domain ACCESS_DOMAIN \
+  --reverse-port 587 \
+  --reverse-cert-mode letsencrypt \
+  --letsencrypt-challenge http-01 \
+  --letsencrypt-email admin@example.com \
+  --allowed-dialer-ip VPS_PUBLIC_IP \
+  --username reverse1 \
+  --secret-file /root/reverse.secret \
+  --export-reverse-package \
+  --yes
+```
+
+For HTTP-01, `ACCESS_DOMAIN` must resolve to the Iran-side Access Node, public TCP/80 must be reachable, and no other service may occupy port 80 during issuance.
+
+VPS Exit Node:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts/bootstrap.sh | sudo bash -s -- \
+  --role server \
+  --mode reverse-dial \
+  --repo GITHUB_USER/REPO_NAME \
+  --ref main \
+  --reverse-host ACCESS_DOMAIN \
+  --reverse-port 587 \
+  --reverse-domain ACCESS_DOMAIN \
+  --tls-verify-mode system-ca \
+  --username reverse1 \
+  --secret-file /root/reverse.secret \
+  --yes
+```
+
+Firewall recommendation on the Access Node:
+
+```bash
+sudo ufw allow from VPS_PUBLIC_IP to any port 587 proto tcp
+```
+
+Test from the Access Node:
+
+```bash
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+```
+
+Let's Encrypt renewal test:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+DNS-01/manual mode is available with `--reverse-cert-mode letsencrypt --letsencrypt-challenge dns-01`. It requires DNS control. DNS API provider plugins are not automated in Stage 1.
+
+Private CA fallback is available with `--reverse-cert-mode private-ca`. Copy the generated public CA from the Access Node or use the exported reverse-dial bundle, then install the VPS with `--tls-verify-mode private-ca --reverse-ca-cert /path/to/ca.crt`.
+
+Reverse-dial bundles do not include the reverse auth secret unless you explicitly pass `--include-reverse-secret` or answer yes to the installer prompt. Bundles never include the Access Node TLS private key, Let's Encrypt `privkey.pem`, `users.yaml`, or unrelated secrets.
 
 ---
 
@@ -608,7 +697,7 @@ then installation completed. The `scripts/bootstrap.sh` cleanup logic should sti
 - This project does not guarantee that traffic will never be detected or blocked.
 - Python/OpenSSL TLS fingerprints remain observable.
 - Long-lived TLS over an SMTP-like port may look unusual.
-- Reverse mode is not implemented in this version.
+- Reverse mode is optional. Stage 1 supports one reverse tunnel session; mTLS and multi-session pooling are planned separately.
 - Use this tool only in environments where you have authorization and where its use is lawful.
 
 ---
