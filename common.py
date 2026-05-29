@@ -127,7 +127,7 @@ def encode_frame(frame_type: int, channel_id: int, payload: bytes = b'') -> byte
     if not isinstance(payload, (bytes, bytearray)):
         raise FrameProtocolError("Frame payload must be bytes")
 
-    payload_bytes = bytes(payload)
+    payload_bytes = payload if isinstance(payload, bytes) else bytes(payload)
     validate_frame_header(frame_type, channel_id, len(payload_bytes))
     return struct.pack('>BHH', frame_type, channel_id, len(payload_bytes)) + payload_bytes
 
@@ -182,14 +182,19 @@ class ActiveFrameBuffer:
     """Accumulates stream bytes and extracts complete active frames."""
 
     def __init__(self):
-        self.buffer = b''
+        self.buffer = bytearray()
 
     def append(self, data: bytes):
-        self.buffer += data
+        self.buffer.extend(data)
 
     def get_frames(self) -> List[ActiveFrame]:
-        frames = []
+        return [
+            ActiveFrame(frame_type, channel_id, payload)
+            for frame_type, channel_id, payload in self.iter_frames()
+        ]
 
+    def iter_frames(self):
+        """Yield complete frames without allocating an intermediate frame list."""
         while len(self.buffer) >= FRAME_HEADER_SIZE:
             frame_type, channel_id, payload_len = parse_frame_header(self.buffer)
             total_len = FRAME_HEADER_SIZE + payload_len
@@ -197,14 +202,12 @@ class ActiveFrameBuffer:
             if len(self.buffer) < total_len:
                 break
 
-            payload = self.buffer[FRAME_HEADER_SIZE:total_len]
-            self.buffer = self.buffer[total_len:]
-            frames.append(ActiveFrame(frame_type, channel_id, payload))
-
-        return frames
+            payload = bytes(self.buffer[FRAME_HEADER_SIZE:total_len])
+            del self.buffer[:total_len]
+            yield frame_type, channel_id, payload
 
     def clear(self):
-        self.buffer = b''
+        self.buffer.clear()
 
 
 # ============================================================================
@@ -978,6 +981,12 @@ class TransportConfig:
 
 
 @dataclass
+class PerformanceConfig:
+    """Named performance profile."""
+    profile: str = 'balanced'
+
+
+@dataclass
 class SMTPConfig:
     """SMTP compatibility knobs."""
     ehlo_name: str = 'tunnel-client.local'
@@ -1266,28 +1275,66 @@ def build_logging_config(config_data: dict) -> LoggingConfig:
     )
 
 
+def build_performance_config(config_data: dict) -> PerformanceConfig:
+    """Build named performance profile config."""
+    performance_conf = (config_data or {}).get('performance', {}) or {}
+    profile = (performance_conf.get('profile', 'balanced') or 'balanced').strip().lower()
+    if profile not in ('compatibility', 'balanced', 'throughput'):
+        raise ValueError("performance.profile must be compatibility, balanced, or throughput")
+    return PerformanceConfig(profile=profile)
+
+
 def build_transport_config(config_data: dict) -> TransportConfig:
     """Build transport tuning config without changing the wire protocol."""
     transport_conf = (config_data or {}).get('transport', {}) or {}
+    performance = build_performance_config(config_data)
+    if performance.profile == 'compatibility':
+        defaults = {
+            'read_chunk_size': 32768,
+            'drain_bytes': 65536,
+            'drain_interval_ms': 0,
+            'socket_send_buffer': 0,
+            'socket_recv_buffer': 0,
+            'pending_buffer_limit': 1048576,
+        }
+    elif performance.profile == 'throughput':
+        defaults = {
+            'read_chunk_size': 65535,
+            'drain_bytes': 1048576,
+            'drain_interval_ms': 25,
+            'socket_send_buffer': 1048576,
+            'socket_recv_buffer': 1048576,
+            'pending_buffer_limit': 4194304,
+        }
+    else:
+        defaults = {
+            'read_chunk_size': 65535,
+            'drain_bytes': 262144,
+            'drain_interval_ms': 10,
+            'socket_send_buffer': 0,
+            'socket_recv_buffer': 0,
+            'pending_buffer_limit': 1048576,
+        }
+
     return TransportConfig(
         read_chunk_size=_as_int(
-            transport_conf.get('read_chunk_size'), 65535,
+            transport_conf.get('read_chunk_size'), defaults['read_chunk_size'],
             'transport.read_chunk_size', minimum=1024, maximum=65535
         ),
         drain_bytes=_as_int(
-            transport_conf.get('drain_bytes'), 262144,
+            transport_conf.get('drain_bytes'), defaults['drain_bytes'],
             'transport.drain_bytes', minimum=1
         ),
         drain_interval_ms=_as_int(
-            transport_conf.get('drain_interval_ms'), 10,
+            transport_conf.get('drain_interval_ms'), defaults['drain_interval_ms'],
             'transport.drain_interval_ms', minimum=0
         ),
         socket_send_buffer=_as_optional_int(
-            transport_conf.get('socket_send_buffer'), 0,
+            transport_conf.get('socket_send_buffer'), defaults['socket_send_buffer'],
             'transport.socket_send_buffer', minimum=0
         ),
         socket_recv_buffer=_as_optional_int(
-            transport_conf.get('socket_recv_buffer'), 0,
+            transport_conf.get('socket_recv_buffer'), defaults['socket_recv_buffer'],
             'transport.socket_recv_buffer', minimum=0
         ),
         tcp_nodelay=_as_bool(
@@ -1299,7 +1346,7 @@ def build_transport_config(config_data: dict) -> TransportConfig:
             'transport.tcp_keepalive'
         ),
         pending_buffer_limit=_as_int(
-            transport_conf.get('pending_buffer_limit'), 1048576,
+            transport_conf.get('pending_buffer_limit'), defaults['pending_buffer_limit'],
             'transport.pending_buffer_limit', minimum=65536
         ),
     )
