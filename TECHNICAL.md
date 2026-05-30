@@ -793,6 +793,9 @@ For reverse mode, the final tested production target for this deployment is:
 ```yaml
 tunnel:
   connections: 20
+  adaptive_connections: true
+  min_connections: 8
+  max_connections: 20
 
 performance:
   profile: throughput
@@ -809,9 +812,29 @@ deployment testing:
 - `24`: experimental; may improve download but can hurt upload and increase noise
 - `>24`: not recommended without explicit testing
 
+Adaptive reverse-dial mode starts `min_connections` sessions, scales toward
+`max_connections` when active channels or throughput cross thresholds, and scales
+down after idle time. It never closes sessions with active channels. Fixed mode
+remains available by setting `adaptive_connections: false`; existing
+`connections: 20` deployments keep their old behavior unless adaptive mode is
+enabled.
+
+Reconnect storm protection tracks failed reverse dial attempts in a rolling
+window. If failures exceed `reconnect_circuit_breaker_failures`, most sessions
+pause for `reconnect_circuit_breaker_cooldown` while one probe continues. When
+connectivity returns, adaptive mode ramps sessions gradually using
+`session_start_interval_seconds` plus jitter. Idle session recycling is disabled
+by default and, when enabled, only recycles idle sessions one at a time by
+default.
+
 Port behavior also matters. In this deployment, `8443` performed better than
 `587`. The tunnel cannot exceed a bad raw path, and upload/download can behave
-differently.
+differently. ICMP/ping alone is not conclusive; use TCP checks such as:
+
+```bash
+nc -vz -w5 ACCESS_DOMAIN 8443
+sudo tcpdump -ni any host VPS_IP and port 8443
+```
 
 Stage 2.1 adds explicit health and accounting per reverse session:
 
@@ -844,7 +867,7 @@ metrics:
 By default, reverse status is concise:
 
 ```text
-Reverse status: configured=20 active=20 active_channels=7 total_channels=134 failures=0 bytes_in=... bytes_out=...
+Reverse status: mode=adaptive min=8 max=20 target=8 active=8 active_channels=0 failures=0 bytes_in=... bytes_out=...
 ```
 
 Per-session metrics are logged only when `metrics.verbose: true` or debug
