@@ -30,7 +30,7 @@ V2Ray / Application
         v
 Access Node in Iran
 local SOCKS5 127.0.0.1:1080
-reverse listener on port 587
+reverse listener on port 8443
         ^
         |
 Exit Node on foreign VPS dials inward
@@ -95,7 +95,8 @@ On the foreign VPS:
 ```text
 Ubuntu/Debian Linux
 Python 3.8+
-Port 587 must be open
+Normal mode: port 587 must be open on the VPS
+Reverse mode: outbound access to the Access Node reverse port, tested target 8443
 A domain or hostname is recommended
 ```
 
@@ -124,7 +125,7 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --socks-host 127.0.0.1 \
   --socks-port 1080 \
   --reverse-domain ACCESS_DOMAIN \
-  --reverse-port 587 \
+  --reverse-port 8443 \
   --reverse-cert-mode letsencrypt \
   --letsencrypt-challenge http-01 \
   --letsencrypt-email admin@example.com \
@@ -146,12 +147,12 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --repo AlirezaKF/smtp-tunnel-proxy \
   --ref main \
   --reverse-host ACCESS_DOMAIN \
-  --reverse-port 587 \
+  --reverse-port 8443 \
   --reverse-domain ACCESS_DOMAIN \
   --tls-verify-mode system-ca \
   --username reverse1 \
   --secret-file /root/reverse.secret \
-  --connections 4 \
+  --connections 20 \
   --performance-profile throughput \
   --yes
 ```
@@ -159,7 +160,7 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
 Firewall recommendation on the Access Node:
 
 ```bash
-sudo ufw allow from VPS_PUBLIC_IP to any port 587 proto tcp
+sudo ufw allow from VPS_PUBLIC_IP to any port 8443 proto tcp
 ```
 
 Test from the Access Node:
@@ -171,25 +172,26 @@ curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 Verify that multiple reverse sessions are established from the VPS:
 
 ```bash
-sudo ss -tnp | grep ':587'
+sudo ss -tnp | grep ':8443'
 sudo journalctl -u smtp-tunnel -f
 ```
 
 Stage 2 reverse mode uses `tunnel.connections` independent tunnel sessions. New SOCKS channels are assigned to the least-active reverse session. This improves aggregate throughput and concurrent flows when the network benefits from parallel streams. It does not stripe one TCP flow across multiple tunnels, so a single download or single TCP connection can still be limited by one tunnel session.
 
-Recommended starting point:
+Final tested production target for this deployment:
 
 ```yaml
 tunnel:
-  connections: 4
+  connections: 20
   connect_timeout: 10
 
 performance:
-  profile: balanced
+  profile: throughput
 
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 logging:
   log_destinations: false
@@ -204,7 +206,17 @@ transport:
   tcp_keepalive: true
 ```
 
-If 4 is worse than 2 or 8 on your specific route, test and use the value that performs best.
+Raw port behavior matters. In this deployment, port `8443` tested better than `587`, and `20` reverse sessions gave the best balance seen so far. If `20` performs worse on another route, test `12`, `16`, and `24` and use the value that performs best.
+
+Connection-count guidance from deployment testing:
+
+- `4`: conservative
+- `8`: improved aggregate throughput
+- `12`: good balance
+- `16`: high performance
+- `20`: recommended production value for this deployment
+- `24`: experimental; may improve download but can hurt upload and increase noise
+- `>24`: not recommended without explicit testing
 
 Count session distribution on the VPS Exit Node:
 
@@ -270,8 +282,45 @@ CPU and TCP state checks:
 
 ```bash
 top -p "$(pgrep -f 'smtp-tunnel|client.py|server.py' | paste -sd, -)"
-sudo ss -tinp | grep ':587'
+sudo ss -tinp | grep ':8443'
 ```
+
+Raw reverse-port baseline test:
+
+```bash
+# Access Node
+sudo systemctl stop smtp-tunnel
+sudo iperf3 -s -p PORT --one-off
+
+# Exit Node
+iperf3 -c ACCESS_IP -p PORT -P 4 -t 20
+```
+
+Recommended ports to compare: `587`, `8443`, `2525`, `5202`, and `443` if free. The tunnel cannot exceed a bad raw path. Server-side HTTP endpoints such as Cloudflare speed tests can rate-limit concurrent curls with HTTP `429`, so treat those results as endpoint-limited when they return tiny byte counts. Mobile speed tests may differ from server-side multi-flow tests, and upload/download can behave differently.
+
+Verify the production reverse session count:
+
+```bash
+sudo ss -tnp | grep ':8443' | wc -l
+```
+
+Expected value with `tunnel.connections: 20` is `20`.
+
+Production status log:
+
+```bash
+sudo journalctl -u smtp-tunnel -f | grep -iE 'Reverse status|disconnect|reconnect|failure'
+```
+
+Expected steady state: `active=20` and `failures=0`.
+
+Troubleshooting:
+
+- If phone download is low but 20 sessions are active, the app may not use enough parallel flows.
+- If upload is low, try lowering `tunnel.connections` to `16`.
+- If `active` drops below the configured count, inspect firewall and reconnect logs.
+- If failures increase, lower from `20` to `16` and retest.
+- If one single download remains slow, future single-flow striping is the relevant optional work.
 
 Let's Encrypt renewal test:
 
@@ -284,6 +333,77 @@ DNS-01/manual mode is available with `--reverse-cert-mode letsencrypt --letsencr
 Private CA fallback is available with `--reverse-cert-mode private-ca`. Copy the generated public CA from the Access Node or use the exported reverse-dial bundle, then install the VPS with `--tls-verify-mode private-ca --reverse-ca-cert /path/to/ca.crt`.
 
 Reverse-dial bundles do not include the reverse auth secret unless you explicitly pass `--include-reverse-secret` or answer yes to the installer prompt. Bundles never include the Access Node TLS private key, Let's Encrypt `privkey.pem`, `users.yaml`, or unrelated secrets.
+
+---
+
+# Production Reverse Migration
+
+To migrate an existing reverse-listen Access Node to the tested production port/profile without replacing TLS settings, credentials, SOCKS settings, or Let's Encrypt paths:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/scripts/bootstrap.sh | sudo bash -s -- \
+  --role client \
+  --mode reverse-listen \
+  --repo AlirezaKF/smtp-tunnel-proxy \
+  --ref main \
+  --reverse-port 8443 \
+  --performance-profile throughput \
+  --migrate-config \
+  --non-interactive
+```
+
+To migrate an existing reverse-dial Exit Node:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/scripts/bootstrap.sh | sudo bash -s -- \
+  --role server \
+  --mode reverse-dial \
+  --repo AlirezaKF/smtp-tunnel-proxy \
+  --ref main \
+  --reverse-port 8443 \
+  --connections 20 \
+  --performance-profile throughput \
+  --migrate-config \
+  --non-interactive
+```
+
+The migration path only changes the requested reverse port, `tunnel.connections` on reverse-dial when passed, `performance.profile` when passed, and missing runtime defaults under `metrics`, `logging`, `transport`, and `tunnel.connect_timeout`.
+
+You can also use the preset flag in reverse mode:
+
+```bash
+sudo bash ./install.sh --role server --mode reverse-dial --production-reverse-tuning --migrate-config --non-interactive
+```
+
+`--production-reverse-tuning` sets `performance.profile: throughput`; for reverse-dial it also sets `tunnel.connections: 20` unless `--connections` was explicitly provided.
+
+---
+
+# Clean Reverse Reinstall
+
+Preserve only the shared reverse secret before a clean reinstall:
+
+```bash
+sudo mkdir -p /root/smtp-tunnel-keep
+sudo cp /etc/smtp-tunnel/reverse.secret /root/smtp-tunnel-keep/reverse.secret
+sudo chmod 600 /root/smtp-tunnel-keep/reverse.secret
+```
+
+Clean removal:
+
+```bash
+sudo systemctl stop smtp-tunnel 2>/dev/null || true
+sudo systemctl disable smtp-tunnel 2>/dev/null || true
+sudo rm -f /etc/systemd/system/smtp-tunnel.service
+sudo rm -rf /opt/smtp-tunnel
+sudo rm -rf /etc/smtp-tunnel
+sudo rm -rf /var/log/smtp-tunnel
+sudo rm -f /usr/local/bin/smtp-tunnel-*
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+```
+
+Do not remove `/etc/letsencrypt`, Xray/3x-ui files, or `/root/smtp-tunnel-keep/reverse.secret` during tunnel reinstall.
 
 ---
 
