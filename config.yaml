@@ -74,6 +74,23 @@ tunnel:
   # Reverse guidance: 4 conservative, 8 improved aggregate, 12 balanced,
   # 16 high performance, 20 tested production target, 24 experimental.
   connections: 1
+  # Adaptive reverse-dial mode starts fewer idle sessions and scales up under load.
+  adaptive_connections: false
+  min_connections: 8
+  max_connections: 20
+  scale_up_active_channels: 6
+  scale_up_bytes_per_second: 524288
+  scale_down_idle_seconds: 300
+  session_start_interval_seconds: 2
+  session_start_jitter_seconds: 5
+  reconnect_global_backoff: true
+  reconnect_circuit_breaker_failures: 10
+  reconnect_circuit_breaker_window_seconds: 120
+  reconnect_circuit_breaker_cooldown: 300
+  idle_session_recycle: false
+  idle_session_recycle_min_age_seconds: 3600
+  idle_session_recycle_jitter_seconds: 900
+  idle_session_recycle_max_per_cycle: 1
 
   # Outbound destination connect timeout on the Exit Node.
   connect_timeout: 10
@@ -151,6 +168,9 @@ smtp:
 #
 # tunnel:
 #   connections: 20  # tested production target for this deployment
+#   adaptive_connections: true
+#   min_connections: 8
+#   max_connections: 20
 #
 # Exit Node / VPS (server.py):
 #
