@@ -51,6 +51,7 @@ All other options are passed through to install.sh, for example:
   --role server --hostname mail.example.com
   --role client --server-host mail.example.com --from-package /root/client.tar.gz
   --role server --mode reverse-dial --performance-profile throughput
+  --role server --mode reverse-dial --production-reverse-tuning
 EOF
 }
 
