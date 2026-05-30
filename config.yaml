@@ -71,7 +71,8 @@ tunnel:
 
   # Number of reverse-dial tunnel sessions from VPS to Access Node.
   # Normal mode and generic examples default to 1.
-  # Recommended starting point for reverse mode throughput testing: 4.
+  # Reverse guidance: 4 conservative, 8 improved aggregate, 12 balanced,
+  # 16 high performance, 20 tested production target, 24 experimental.
   connections: 1
 
   # Outbound destination connect timeout on the Exit Node.
@@ -90,6 +91,8 @@ metrics:
   # Reverse status logs are useful while tuning multi-session reverse mode.
   enabled: true
   log_interval: 30
+  # false logs concise aggregate status; true adds per-session counters.
+  verbose: false
 
 logging:
   # false redacts CONNECT destinations in logs. Set true only for debugging.
@@ -130,7 +133,7 @@ smtp:
 #   socks_port: 1080
 #   reverse:
 #     listen_host: "0.0.0.0"
-#     listen_port: 587
+#     listen_port: 8443
 #     auth_username: "reverse1"
 #     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
 #     allowed_dialer_ips:
@@ -147,7 +150,7 @@ smtp:
 #       enabled: false  # planned for Stage 1b
 #
 # tunnel:
-#   connections: 4  # recommended starting point for reverse-dial mode
+#   connections: 20  # tested production target for this deployment
 #
 # Exit Node / VPS (server.py):
 #
@@ -155,7 +158,7 @@ smtp:
 #   mode: reverse-dial
 #   reverse:
 #     access_host: "access.example.com"
-#     access_port: 587
+#     access_port: 8443
 #     tls_server_name: "access.example.com"
 #     auth_username: "reverse1"
 #     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
