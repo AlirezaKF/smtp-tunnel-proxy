@@ -262,6 +262,10 @@ Verify periodic reverse status logs:
 sudo journalctl -u smtp-tunnel -f | grep -i 'Reverse status'
 ```
 
+Adaptive scale-down is based on user DATA bytes and channel open/close activity.
+Keepalive/control frames can increase diagnostic `bytes_in` and `bytes_out`, but
+they do not keep the tunnel "busy" for adaptive scale decisions.
+
 Lightweight concurrency test:
 
 ```bash
