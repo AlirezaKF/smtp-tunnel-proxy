@@ -23,7 +23,7 @@ import os
 import random
 import time
 import socket
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 from dataclasses import dataclass
 
 from common import (
@@ -592,6 +592,7 @@ class ReverseExitSession:
         logging_config: LoggingConfig = None,
         transport_config: TransportConfig = None,
         session_id: int = 1,
+        stats_callback=None,
     ):
         self.reader = reader
         self.writer = writer
@@ -607,6 +608,7 @@ class ReverseExitSession:
         self.drain_tasks: Dict[int, asyncio.Task] = {}
         self.keepalive_ack_event = asyncio.Event()
         self.connected = True
+        self.stats_callback = stats_callback
 
     async def run(self):
         frame_buffer = ActiveFrameBuffer()
@@ -619,6 +621,8 @@ class ReverseExitSession:
                     )
                     if not chunk:
                         break
+                    if self.stats_callback:
+                        self.stats_callback.record_session_bytes(self.session_id, bytes_in=len(chunk))
                     frame_buffer.append(chunk)
                     for frame_type, channel_id, payload in frame_buffer.iter_frames():
                         await self._handle_frame(frame_type, channel_id, payload)
@@ -668,6 +672,8 @@ class ReverseExitSession:
                     connected=True,
                 )
                 self.channels[channel_id] = channel
+                if self.stats_callback:
+                    self.stats_callback.record_channel_open(self.session_id)
                 await self._send_frame(FRAME_CONNECT_OK, channel_id)
                 self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
                 logger.info(f"[reverse session {self.session_id}] CONNECT success ch={channel_id}")
@@ -716,6 +722,8 @@ class ReverseExitSession:
             async with self.write_lock:
                 frame = encode_frame(frame_type, channel_id, payload)
                 self.writer.write(frame)
+                if self.stats_callback:
+                    self.stats_callback.record_session_bytes(self.session_id, bytes_out=len(frame))
                 await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
         except FrameProtocolError as e:
             logger.error(f"[reverse session {self.session_id}] Refusing malformed frame: {e}")
@@ -777,6 +785,8 @@ class ReverseExitSession:
             except Exception:
                 pass
         self.channels.pop(channel.channel_id, None)
+        if self.stats_callback:
+            self.stats_callback.record_channel_close(self.session_id)
         if channel.writer:
             task = self.drain_tasks.pop(id(channel.writer), None)
             if task:
@@ -820,6 +830,206 @@ class ReverseDialer:
         self.tunnel_config = tunnel_config or TunnelConfig()
         self.logging_config = logging_config or LoggingConfig()
         self.transport_config = transport_config or TransportConfig()
+        self.session_tasks: Dict[int, asyncio.Task] = {}
+        self.session_active_channels: Dict[int, int] = {}
+        self.session_bytes_in: Dict[int, int] = {}
+        self.session_bytes_out: Dict[int, int] = {}
+        self.session_connected_since: Dict[int, float] = {}
+        self.session_last_activity: Dict[int, float] = {}
+        self.session_failures: Dict[int, int] = {}
+        self.failure_events = []
+        self.circuit_breaker_until = 0.0
+        self.target_connections = max(1, int(self.tunnel_config.connections or 1))
+        self.next_session_id = 1
+        self._last_total_bytes = 0
+        self._last_throughput_check = time.monotonic()
+        self._last_activity_at = time.monotonic()
+
+    def record_session_bytes(self, session_id: int, bytes_in: int = 0, bytes_out: int = 0):
+        now = time.monotonic()
+        if bytes_in:
+            self.session_bytes_in[session_id] = self.session_bytes_in.get(session_id, 0) + bytes_in
+        if bytes_out:
+            self.session_bytes_out[session_id] = self.session_bytes_out.get(session_id, 0) + bytes_out
+        if bytes_in or bytes_out:
+            self.session_last_activity[session_id] = now
+            self._last_activity_at = now
+
+    def record_channel_open(self, session_id: int):
+        self.session_active_channels[session_id] = self.session_active_channels.get(session_id, 0) + 1
+        self.session_last_activity[session_id] = time.monotonic()
+        self._last_activity_at = self.session_last_activity[session_id]
+
+    def record_channel_close(self, session_id: int):
+        current = self.session_active_channels.get(session_id, 0)
+        self.session_active_channels[session_id] = max(0, current - 1)
+        self.session_last_activity[session_id] = time.monotonic()
+
+    def record_session_connected(self, session_id: int):
+        now = time.monotonic()
+        self.session_connected_since[session_id] = now
+        self.session_last_activity[session_id] = now
+        self.session_active_channels.setdefault(session_id, 0)
+        self.session_bytes_in.setdefault(session_id, 0)
+        self.session_bytes_out.setdefault(session_id, 0)
+
+    def record_session_disconnected(self, session_id: int):
+        self.session_connected_since.pop(session_id, None)
+        self.session_active_channels[session_id] = 0
+
+    def active_session_count(self) -> int:
+        return len(self.session_connected_since)
+
+    def total_active_channels(self) -> int:
+        return sum(self.session_active_channels.values())
+
+    def total_bytes(self) -> int:
+        return sum(self.session_bytes_in.values()) + sum(self.session_bytes_out.values())
+
+    def record_connect_failure(self, session_id: int):
+        now = time.monotonic()
+        window = float(self.tunnel_config.reconnect_circuit_breaker_window_seconds)
+        self.failure_events = [t for t in self.failure_events if now - t <= window]
+        self.failure_events.append(now)
+        self.session_failures[session_id] = self.session_failures.get(session_id, 0) + 1
+        threshold = int(self.tunnel_config.reconnect_circuit_breaker_failures)
+        if (
+            self.tunnel_config.reconnect_global_backoff
+            and len(self.failure_events) >= threshold
+            and now >= self.circuit_breaker_until
+        ):
+            cooldown = float(self.tunnel_config.reconnect_circuit_breaker_cooldown)
+            self.circuit_breaker_until = now + cooldown
+            logger.warning(
+                f"Reverse circuit breaker active: failures={len(self.failure_events)} "
+                f"cooldown={cooldown:.0f}s"
+            )
+
+    def circuit_breaker_active(self) -> bool:
+        return time.monotonic() < self.circuit_breaker_until
+
+    def should_probe_during_circuit_breaker(self, session_id: int) -> bool:
+        return session_id == min(self.session_tasks.keys() or {session_id})
+
+    def _recent_bytes_per_second(self) -> float:
+        now = time.monotonic()
+        total = self.total_bytes()
+        elapsed = max(0.001, now - self._last_throughput_check)
+        rate = (total - self._last_total_bytes) / elapsed
+        self._last_total_bytes = total
+        self._last_throughput_check = now
+        return max(0.0, rate)
+
+    def update_adaptive_target(self, now: Optional[float] = None) -> Tuple[int, Optional[str]]:
+        now = now or time.monotonic()
+        min_conn = int(self.tunnel_config.min_connections)
+        max_conn = int(self.tunnel_config.max_connections)
+        old_target = self.target_connections
+        rate = self._recent_bytes_per_second()
+        active_channels = self.total_active_channels()
+        reason = None
+
+        if (
+            active_channels >= int(self.tunnel_config.scale_up_active_channels)
+            or rate >= int(self.tunnel_config.scale_up_bytes_per_second)
+        ):
+            self.target_connections = min(max_conn, max(min_conn, self.target_connections + 1))
+            reason = 'active_channels' if active_channels >= int(self.tunnel_config.scale_up_active_channels) else 'throughput'
+        elif (
+            self.target_connections > min_conn
+            and active_channels == 0
+            and now - self._last_activity_at >= float(self.tunnel_config.scale_down_idle_seconds)
+        ):
+            self.target_connections = max(min_conn, self.target_connections - 1)
+            reason = 'idle'
+
+        if self.target_connections != old_target:
+            direction = 'up' if self.target_connections > old_target else 'down'
+            logger.info(f"Reverse adaptive scale {direction}: target={self.target_connections} reason={reason}")
+        return self.target_connections, reason
+
+    def choose_idle_sessions_to_close(self, count: int) -> Set[int]:
+        candidates = [
+            (
+                self.session_bytes_in.get(session_id, 0) + self.session_bytes_out.get(session_id, 0),
+                self.session_last_activity.get(session_id, 0.0),
+                session_id,
+            )
+            for session_id in self.session_tasks
+            if self.session_active_channels.get(session_id, 0) == 0
+        ]
+        candidates.sort()
+        return {session_id for _, _, session_id in candidates[:max(0, count)]}
+
+    def choose_idle_sessions_to_recycle(self, now: Optional[float] = None) -> Set[int]:
+        if not self.tunnel_config.idle_session_recycle:
+            return set()
+        now = now or time.monotonic()
+        max_count = int(self.tunnel_config.idle_session_recycle_max_per_cycle)
+        base_age = float(self.tunnel_config.idle_session_recycle_min_age_seconds)
+        jitter = float(self.tunnel_config.idle_session_recycle_jitter_seconds)
+        candidates = []
+        for session_id in self.session_tasks:
+            if self.session_active_channels.get(session_id, 0) != 0:
+                continue
+            connected_since = self.session_connected_since.get(session_id)
+            if connected_since is None:
+                continue
+            threshold = base_age + random.uniform(0, jitter) if jitter else base_age
+            if now - connected_since >= threshold:
+                recent_bytes = self.session_bytes_in.get(session_id, 0) + self.session_bytes_out.get(session_id, 0)
+                candidates.append((recent_bytes, connected_since, session_id))
+        candidates.sort()
+        return {session_id for _, _, session_id in candidates[:max_count]}
+
+    async def stop_session(self, session_id: int):
+        task = self.session_tasks.pop(session_id, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.record_session_disconnected(session_id)
+
+    async def start_session(self, session_id: int):
+        self.session_tasks[session_id] = asyncio.create_task(self.run_session_forever(session_id))
+
+    async def reconcile_adaptive_sessions(self):
+        while len(self.session_tasks) < self.target_connections:
+            session_id = self.next_session_id
+            self.next_session_id += 1
+            await self.start_session(session_id)
+            delay = float(self.tunnel_config.session_start_interval_seconds)
+            jitter = float(self.tunnel_config.session_start_jitter_seconds)
+            sleep_for = delay + (random.uniform(0, jitter) if jitter else 0.0)
+            logger.info(
+                f"Reverse adaptive starting session {session_id}; "
+                f"target={self.target_connections} next_start_delay={sleep_for:.1f}s"
+            )
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+        extra = len(self.session_tasks) - self.target_connections
+        if extra > 0:
+            for session_id in self.choose_idle_sessions_to_close(extra):
+                logger.info(f"Reverse adaptive closing idle session {session_id}; target={self.target_connections}")
+                await self.stop_session(session_id)
+
+        if len(self.session_tasks) >= self.target_connections:
+            for session_id in self.choose_idle_sessions_to_recycle():
+                logger.info(f"Reverse adaptive recycling idle session {session_id}")
+                await self.stop_session(session_id)
+
+    def status_line(self) -> str:
+        failures = sum(self.session_failures.values())
+        return (
+            f"Reverse status: mode=adaptive min={self.tunnel_config.min_connections} "
+            f"max={self.tunnel_config.max_connections} target={self.target_connections} "
+            f"active={self.active_session_count()} active_channels={self.total_active_channels()} "
+            f"failures={failures} bytes_in={sum(self.session_bytes_in.values())} "
+            f"bytes_out={sum(self.session_bytes_out.values())}"
+        )
 
     def _create_ssl_context(self) -> ssl.SSLContext:
         tls = self.reverse_config.tls
@@ -950,9 +1160,12 @@ class ReverseDialer:
                 self.logging_config,
                 self.transport_config,
                 session_id=session_id,
+                stats_callback=self,
             )
+            self.record_session_connected(session_id)
             await session.run()
         finally:
+            self.record_session_disconnected(session_id)
             try:
                 writer.close()
                 await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
@@ -967,6 +1180,11 @@ class ReverseDialer:
 
         while True:
             try:
+                if self.circuit_breaker_active() and not self.should_probe_during_circuit_breaker(session_id):
+                    sleep_for = max(1.0, self.circuit_breaker_until - time.monotonic())
+                    logger.info(f"Reverse dial session {session_id} paused by circuit breaker for {sleep_for:.1f}s")
+                    await asyncio.sleep(sleep_for)
+                    continue
                 await self.connect_once(session_id)
                 delay = initial
                 logger.warning(f"Reverse dial session {session_id} disconnected")
@@ -974,6 +1192,7 @@ class ReverseDialer:
                 raise
             except Exception as e:
                 logger.warning(f"Reverse dial session {session_id} failed: {e}")
+                self.record_connect_failure(session_id)
 
             spread = delay * jitter
             sleep_for = max(0.0, delay + random.uniform(-spread, spread))
@@ -982,6 +1201,9 @@ class ReverseDialer:
             delay = min(delay * 2, max_delay)
 
     async def run_forever(self):
+        if self.tunnel_config.adaptive_connections:
+            await self.run_adaptive_forever()
+            return
         connections = max(1, int(self.tunnel_config.connections or 1))
         logger.info(f"Reverse dial configured sessions: {connections}")
         tasks = [
@@ -998,6 +1220,26 @@ class ReverseDialer:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    async def run_adaptive_forever(self):
+        min_conn = max(1, int(self.tunnel_config.min_connections))
+        max_conn = max(min_conn, int(self.tunnel_config.max_connections))
+        self.target_connections = min_conn
+        self.next_session_id = 1
+        logger.info(
+            f"Reverse dial adaptive sessions enabled: min={min_conn} max={max_conn} "
+            f"fixed_fallback={self.tunnel_config.connections}"
+        )
+        try:
+            await self.reconcile_adaptive_sessions()
+            while True:
+                await asyncio.sleep(5.0)
+                self.update_adaptive_target()
+                await self.reconcile_adaptive_sessions()
+                logger.info(self.status_line())
+        finally:
+            for session_id in list(self.session_tasks):
+                await self.stop_session(session_id)
 
 
 def build_server_settings(config_data: dict, args) -> Tuple[
