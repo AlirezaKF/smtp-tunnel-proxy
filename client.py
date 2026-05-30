@@ -1115,8 +1115,12 @@ class ReverseAccessListener:
             total_failures = sum(stat.failure_count for stat in stats)
             total_bytes_in = sum(stat.bytes_in for stat in stats)
             total_bytes_out = sum(stat.bytes_out for stat in stats)
+            mode = 'adaptive' if self.tunnel_config.adaptive_connections else 'fixed'
             parts = [
-                f"Reverse status: configured={configured_sessions}",
+                f"Reverse status: mode={mode}",
+                f"min={self.tunnel_config.min_connections}",
+                f"max={self.tunnel_config.max_connections}",
+                f"target={configured_sessions}",
                 f"active={active_sessions}",
                 f"active_channels={total_active_channels}",
                 f"total_channels={total_channels}",
