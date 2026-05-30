@@ -14,6 +14,7 @@ import os
 import base64
 import time
 import ssl
+import logging
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -23,6 +24,8 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.backends import default_backend
+
+logger = logging.getLogger('smtp-tunnel-common')
 
 
 # ============================================================================
@@ -950,6 +953,22 @@ class TunnelConfig:
     reconnect_jitter: float = 0.2
     connections: int = 1
     connect_timeout: float = 10.0
+    adaptive_connections: bool = False
+    min_connections: int = 8
+    max_connections: int = 20
+    scale_up_active_channels: int = 6
+    scale_up_bytes_per_second: int = 524288
+    scale_down_idle_seconds: float = 300.0
+    session_start_interval_seconds: float = 2.0
+    session_start_jitter_seconds: float = 5.0
+    reconnect_global_backoff: bool = True
+    reconnect_circuit_breaker_failures: int = 10
+    reconnect_circuit_breaker_window_seconds: float = 120.0
+    reconnect_circuit_breaker_cooldown: float = 300.0
+    idle_session_recycle: bool = False
+    idle_session_recycle_min_age_seconds: float = 3600.0
+    idle_session_recycle_jitter_seconds: float = 900.0
+    idle_session_recycle_max_per_cycle: int = 1
 
 
 @dataclass
@@ -1239,9 +1258,79 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
             tunnel_conf.get('connect_timeout'), 10.0,
             'tunnel.connect_timeout', minimum=0.1
         ),
+        adaptive_connections=_as_bool(
+            tunnel_conf.get('adaptive_connections'), False,
+            'tunnel.adaptive_connections'
+        ),
+        min_connections=_as_int(
+            tunnel_conf.get('min_connections'), 8,
+            'tunnel.min_connections', minimum=1
+        ),
+        max_connections=_as_int(
+            tunnel_conf.get('max_connections'), 20,
+            'tunnel.max_connections', minimum=1
+        ),
+        scale_up_active_channels=_as_int(
+            tunnel_conf.get('scale_up_active_channels'), 6,
+            'tunnel.scale_up_active_channels', minimum=1
+        ),
+        scale_up_bytes_per_second=_as_int(
+            tunnel_conf.get('scale_up_bytes_per_second'), 524288,
+            'tunnel.scale_up_bytes_per_second', minimum=1
+        ),
+        scale_down_idle_seconds=_as_float(
+            tunnel_conf.get('scale_down_idle_seconds'), 300.0,
+            'tunnel.scale_down_idle_seconds', minimum=1.0
+        ),
+        session_start_interval_seconds=_as_float(
+            tunnel_conf.get('session_start_interval_seconds'), 2.0,
+            'tunnel.session_start_interval_seconds', minimum=0.0
+        ),
+        session_start_jitter_seconds=_as_float(
+            tunnel_conf.get('session_start_jitter_seconds'), 5.0,
+            'tunnel.session_start_jitter_seconds', minimum=0.0
+        ),
+        reconnect_global_backoff=_as_bool(
+            tunnel_conf.get('reconnect_global_backoff'), True,
+            'tunnel.reconnect_global_backoff'
+        ),
+        reconnect_circuit_breaker_failures=_as_int(
+            tunnel_conf.get('reconnect_circuit_breaker_failures'), 10,
+            'tunnel.reconnect_circuit_breaker_failures', minimum=1
+        ),
+        reconnect_circuit_breaker_window_seconds=_as_float(
+            tunnel_conf.get('reconnect_circuit_breaker_window_seconds'), 120.0,
+            'tunnel.reconnect_circuit_breaker_window_seconds', minimum=1.0
+        ),
+        reconnect_circuit_breaker_cooldown=_as_float(
+            tunnel_conf.get('reconnect_circuit_breaker_cooldown'), 300.0,
+            'tunnel.reconnect_circuit_breaker_cooldown', minimum=1.0
+        ),
+        idle_session_recycle=_as_bool(
+            tunnel_conf.get('idle_session_recycle'), False,
+            'tunnel.idle_session_recycle'
+        ),
+        idle_session_recycle_min_age_seconds=_as_float(
+            tunnel_conf.get('idle_session_recycle_min_age_seconds'), 3600.0,
+            'tunnel.idle_session_recycle_min_age_seconds', minimum=1.0
+        ),
+        idle_session_recycle_jitter_seconds=_as_float(
+            tunnel_conf.get('idle_session_recycle_jitter_seconds'), 900.0,
+            'tunnel.idle_session_recycle_jitter_seconds', minimum=0.0
+        ),
+        idle_session_recycle_max_per_cycle=_as_int(
+            tunnel_conf.get('idle_session_recycle_max_per_cycle'), 1,
+            'tunnel.idle_session_recycle_max_per_cycle', minimum=1
+        ),
     )
     if config.reconnect_max_delay < config.reconnect_initial_delay:
         raise ValueError("tunnel.reconnect_max_delay must be >= tunnel.reconnect_initial_delay")
+    if config.max_connections < config.min_connections:
+        raise ValueError("tunnel.max_connections must be >= tunnel.min_connections")
+    if config.connections > 24:
+        logger.warning("tunnel.connections > 24 is not recommended without explicit testing")
+    if config.max_connections > 24:
+        logger.warning("tunnel.max_connections > 24 is not recommended without explicit testing")
     return config
 
 
