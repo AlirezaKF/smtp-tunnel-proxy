@@ -55,12 +55,14 @@ SERVICE_NAME="smtp-tunnel"
 LISTEN_HOST="0.0.0.0"
 LISTEN_PORT="587"
 SERVER_PORT="587"
+REVERSE_PORT_SET=0
 SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 CONNECTIONS="1"
 CONNECTIONS_SET=0
 PERFORMANCE_PROFILE="balanced"
 PERFORMANCE_PROFILE_SET=0
+PRODUCTION_REVERSE_TUNING=0
 HOSTNAME_VALUE=""
 SERVER_HOST=""
 USERNAME_VALUE=""
@@ -142,6 +144,7 @@ Reverse mode options:
   --include-reverse-secret     Include reverse.secret in exported bundle
   --connections N             Reverse tunnel sessions for reverse-dial (fresh reverse default: 4)
   --performance-profile MODE  compatibility|balanced|throughput (default: balanced)
+  --production-reverse-tuning Apply tested reverse defaults: throughput profile and 20 reverse-dial sessions
 
 Upgrade / automation:
   --non-interactive            Do not prompt; fail if required values are missing
@@ -156,6 +159,7 @@ Examples:
   sudo bash ./install.sh --role server
   sudo bash ./install.sh --role server --hostname mail.example.com --listen-port 587 --service-name smtp-tunnel --non-interactive
   sudo bash ./install.sh --role client --server-host mail.example.com --server-port 587 --username alice --secret-file /root/alice.secret --ca-cert ./ca.crt --non-interactive
+  sudo bash ./install.sh --role server --mode reverse-dial --reverse-host access.example.com --reverse-port 8443 --connections 20 --performance-profile throughput --non-interactive
 EOF
 }
 
@@ -209,6 +213,10 @@ parse_args() {
                 PERFORMANCE_PROFILE_SET=1
                 shift 2
                 ;;
+            --production-reverse-tuning)
+                PRODUCTION_REVERSE_TUNING=1
+                shift
+                ;;
             --username)
                 USERNAME_VALUE="${2:-}"
                 shift 2
@@ -245,6 +253,7 @@ parse_args() {
             --reverse-port|--reverse-listen-port|--reverse-client-port)
                 SERVER_PORT="${2:-}"
                 LISTEN_PORT="${2:-}"
+                REVERSE_PORT_SET=1
                 shift 2
                 ;;
             --reverse-domain)
@@ -357,6 +366,7 @@ parse_args() {
 
     validate_role
     validate_mode
+    apply_production_reverse_tuning
 }
 
 validate_role() {
@@ -380,6 +390,24 @@ validate_mode() {
             exit 1
             ;;
     esac
+}
+
+apply_production_reverse_tuning() {
+    if [ "$PRODUCTION_REVERSE_TUNING" -ne 1 ]; then
+        return
+    fi
+    if [ "$MODE" != "reverse-listen" ] && [ "$MODE" != "reverse-dial" ]; then
+        print_warn "--production-reverse-tuning applies only to reverse-listen or reverse-dial mode; leaving normal-mode defaults unchanged"
+        return
+    fi
+
+    PERFORMANCE_PROFILE="throughput"
+    PERFORMANCE_PROFILE_SET=1
+
+    if [ "$MODE" = "reverse-dial" ] && [ "$CONNECTIONS_SET" -eq 0 ]; then
+        CONNECTIONS="20"
+        CONNECTIONS_SET=1
+    fi
 }
 
 check_root() {
@@ -555,6 +583,13 @@ validate_connections_value() {
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
         print_error "--connections must be an integer >= 1"
         exit 1
+    fi
+    if [ "$value" -gt 24 ]; then
+        print_warn "--connections $value is above the recommended tested range. Values above 24 can increase noise and may hurt upload or reliability."
+        if [ "$ASSUME_YES" -ne 1 ] && ! confirm "Continue with --connections $value?"; then
+            print_error "Install cancelled because --connections $value was not confirmed"
+            exit 1
+        fi
     fi
 }
 
@@ -972,11 +1007,17 @@ preflight_role_values() {
     validate_port_value "$SOCKS_PORT" "--socks-port"
     validate_connections_value "$CONNECTIONS"
     validate_performance_profile
+    if [ "$PRODUCTION_REVERSE_TUNING" -eq 1 ] && { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; }; then
+        print_info "Production reverse tuning: enabled"
+    fi
     print_info "Performance profile: $PERFORMANCE_PROFILE"
+    if [ "$MODE" = "reverse-dial" ]; then
+        print_info "Reverse tunnel sessions: $CONNECTIONS"
+    fi
 
     if [ "$MODE" = "reverse-listen" ]; then
         load_secret_from_safe_source
-        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
             require_value "$REVERSE_DOMAIN" "--reverse-domain"
             require_value "$USERNAME_VALUE" "--username"
             [ -n "$SECRET_VALUE" ] || { print_error "reverse-listen needs --secret-file, --secret-env, or interactive secret"; exit 1; }
@@ -994,7 +1035,7 @@ preflight_role_values() {
         fi
     elif [ "$MODE" = "reverse-dial" ]; then
         load_secret_from_safe_source
-        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$MIGRATE_CONFIG" -eq 1 ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
+        if [ "$NON_INTERACTIVE" -eq 1 ] && { [ ! -f "$CONFIG_DIR/config.yaml" ] || [ "$RESET_CONFIG" -eq 1 ]; }; then
             if [ -n "$FROM_REVERSE_PACKAGE" ]; then
                 [ -f "$FROM_REVERSE_PACKAGE" ] || { print_error "--from-reverse-package not found: $FROM_REVERSE_PACKAGE"; exit 1; }
                 return
@@ -1104,6 +1145,130 @@ if connections_set == '1':
 metrics = data.setdefault('metrics', {})
 metrics.setdefault('enabled', True)
 metrics.setdefault('log_interval', 30)
+metrics.setdefault('verbose', False)
+
+logging_conf = data.setdefault('logging', {})
+logging_conf.setdefault('log_destinations', False)
+logging_conf.setdefault('log_session_events', True)
+logging_conf.setdefault('log_metrics', True)
+
+transport = data.setdefault('transport', {})
+transport.setdefault('read_chunk_size', 65535)
+transport.setdefault('drain_bytes', 262144)
+transport.setdefault('drain_interval_ms', 10)
+transport.setdefault('socket_send_buffer', 0)
+transport.setdefault('socket_recv_buffer', 0)
+transport.setdefault('tcp_nodelay', True)
+transport.setdefault('tcp_keepalive', True)
+transport.setdefault('pending_buffer_limit', 1048576)
+
+with open(config_path, 'w', encoding='utf-8') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    chmod 600 "$config_path"
+    return 0
+}
+
+update_existing_reverse_listen_migration() {
+    local config_path="$1"
+    print_step "Migrating reverse-listen config without replacing secrets or TLS settings"
+    if [ "$REVERSE_PORT_SET" -eq 1 ]; then
+        print_info "Reverse listen port: $LISTEN_PORT"
+    fi
+    if [ "$PERFORMANCE_PROFILE_SET" -eq 1 ]; then
+        print_info "Performance profile: $PERFORMANCE_PROFILE"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would update reverse-listen runtime defaults in $config_path"
+        return 0
+    fi
+    "$PYTHON_BIN" - "$config_path" "$LISTEN_PORT" "$REVERSE_PORT_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" << 'PY'
+import sys
+import yaml
+
+config_path, reverse_port, reverse_port_set, profile, profile_set = sys.argv[1:6]
+with open(config_path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+
+client = data.setdefault('client', {})
+if reverse_port_set == '1':
+    reverse = client.setdefault('reverse', {})
+    reverse['listen_port'] = int(reverse_port)
+
+if profile_set == '1':
+    data.setdefault('performance', {})['profile'] = profile
+
+tunnel = data.setdefault('tunnel', {})
+tunnel.setdefault('connect_timeout', 10)
+
+metrics = data.setdefault('metrics', {})
+metrics.setdefault('enabled', True)
+metrics.setdefault('log_interval', 30)
+metrics.setdefault('verbose', False)
+
+logging_conf = data.setdefault('logging', {})
+logging_conf.setdefault('log_destinations', False)
+logging_conf.setdefault('log_session_events', True)
+logging_conf.setdefault('log_metrics', True)
+
+transport = data.setdefault('transport', {})
+transport.setdefault('read_chunk_size', 65535)
+transport.setdefault('drain_bytes', 262144)
+transport.setdefault('drain_interval_ms', 10)
+transport.setdefault('socket_send_buffer', 0)
+transport.setdefault('socket_recv_buffer', 0)
+transport.setdefault('tcp_nodelay', True)
+transport.setdefault('tcp_keepalive', True)
+transport.setdefault('pending_buffer_limit', 1048576)
+
+with open(config_path, 'w', encoding='utf-8') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    chmod 600 "$config_path"
+    return 0
+}
+
+update_existing_reverse_dial_migration() {
+    local config_path="$1"
+    print_step "Migrating reverse-dial config without replacing secrets or TLS settings"
+    if [ "$REVERSE_PORT_SET" -eq 1 ]; then
+        print_info "Reverse access port: $SERVER_PORT"
+    fi
+    if [ "$CONNECTIONS_SET" -eq 1 ]; then
+        print_info "Reverse tunnel sessions: $CONNECTIONS"
+    fi
+    if [ "$PERFORMANCE_PROFILE_SET" -eq 1 ]; then
+        print_info "Performance profile: $PERFORMANCE_PROFILE"
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would update reverse-dial runtime defaults in $config_path"
+        return 0
+    fi
+    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" << 'PY'
+import sys
+import yaml
+
+config_path, reverse_port, reverse_port_set, connections, connections_set, profile, profile_set = sys.argv[1:8]
+with open(config_path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+
+server = data.setdefault('server', {})
+if reverse_port_set == '1':
+    reverse = server.setdefault('reverse', {})
+    reverse['access_port'] = int(reverse_port)
+
+tunnel = data.setdefault('tunnel', {})
+tunnel.setdefault('connect_timeout', 10)
+if connections_set == '1':
+    tunnel['connections'] = int(connections)
+
+if profile_set == '1':
+    data.setdefault('performance', {})['profile'] = profile
+
+metrics = data.setdefault('metrics', {})
+metrics.setdefault('enabled', True)
+metrics.setdefault('log_interval', 30)
+metrics.setdefault('verbose', False)
 
 logging_conf = data.setdefault('logging', {})
 logging_conf.setdefault('log_destinations', False)
@@ -1233,6 +1398,10 @@ write_yaml_list_from_words() {
 
 write_reverse_listen_config() {
     local config_path="$CONFIG_DIR/config.yaml"
+    if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -eq 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        update_existing_reverse_listen_migration "$config_path"
+        return
+    fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
         if update_existing_performance_profile "$config_path"; then
             return
@@ -1300,6 +1469,7 @@ performance:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 transport:
   read_chunk_size: 65535
@@ -1369,6 +1539,10 @@ write_reverse_dial_config() {
     local ca_path=""
     if [ "$CONNECTIONS_SET" -eq 0 ]; then
         CONNECTIONS="4"
+    fi
+    if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -eq 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        update_existing_reverse_dial_migration "$config_path"
+        return
     fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
         if update_existing_performance_profile "$config_path"; then
@@ -1445,6 +1619,7 @@ performance:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 transport:
   read_chunk_size: 65535
@@ -1471,9 +1646,13 @@ export_reverse_dial_bundle() {
     if [ "$MODE" != "reverse-listen" ] || [ "$EXPORT_REVERSE_PACKAGE" -ne 1 ]; then
         return
     fi
-    local bundle_dir bundle_path ca_line secret_line
+    local bundle_dir bundle_path ca_line secret_line bundle_connections
     bundle_dir="$(mktemp -d /tmp/smtp-tunnel-reverse-bundle.XXXXXX)"
     bundle_path="/root/smtp-tunnel-reverse-dial-${USERNAME_VALUE:-vps}.tar.gz"
+    bundle_connections="$CONNECTIONS"
+    if [ "$CONNECTIONS_SET" -eq 0 ]; then
+        bundle_connections="20"
+    fi
     ca_line=""
     secret_line='    # auth_secret_file: "/etc/smtp-tunnel/reverse.secret"'
     if [ "$REVERSE_CERT_MODE" = "private-ca" ] && [ -f "$REVERSE_CERT_DIR/ca.crt" ]; then
@@ -1505,7 +1684,7 @@ $ca_line
       enabled: false
 
 tunnel:
-  connections: 4
+  connections: $bundle_connections
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
@@ -1519,6 +1698,7 @@ performance:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 transport:
   read_chunk_size: 65535
@@ -1617,6 +1797,7 @@ performance:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 transport:
   read_chunk_size: 65535
@@ -1843,6 +2024,7 @@ performance:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 
 transport:
   read_chunk_size: 65535
