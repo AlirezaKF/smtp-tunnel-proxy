@@ -957,6 +957,7 @@ class MetricsConfig:
     """Runtime diagnostics for reverse sessions."""
     enabled: bool = True
     log_interval: float = 30.0
+    verbose: bool = False
 
 
 @dataclass
@@ -1253,6 +1254,7 @@ def build_metrics_config(config_data: dict) -> MetricsConfig:
             metrics_conf.get('log_interval'), 30.0,
             'metrics.log_interval', minimum=1.0
         ),
+        verbose=_as_bool(metrics_conf.get('verbose'), False, 'metrics.verbose'),
     )
 
 
