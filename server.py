@@ -329,6 +329,8 @@ class TunnelSession:
         if frame_type == FRAME_CONNECT:
             await self._handle_connect(channel_id, payload)
         elif frame_type == FRAME_DATA:
+            if self.stats_callback:
+                self.stats_callback.record_user_bytes(self.session_id, bytes_in=len(payload))
             await self._handle_data(channel_id, payload)
         elif frame_type == FRAME_CLOSE:
             await self._handle_close(channel_id)
@@ -724,6 +726,8 @@ class ReverseExitSession:
                 self.writer.write(frame)
                 if self.stats_callback:
                     self.stats_callback.record_session_bytes(self.session_id, bytes_out=len(frame))
+                    if frame_type == FRAME_DATA:
+                        self.stats_callback.record_user_bytes(self.session_id, bytes_out=len(payload))
                 await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
         except FrameProtocolError as e:
             logger.error(f"[reverse session {self.session_id}] Refusing malformed frame: {e}")
@@ -834,6 +838,8 @@ class ReverseDialer:
         self.session_active_channels: Dict[int, int] = {}
         self.session_bytes_in: Dict[int, int] = {}
         self.session_bytes_out: Dict[int, int] = {}
+        self.session_user_bytes_in: Dict[int, int] = {}
+        self.session_user_bytes_out: Dict[int, int] = {}
         self.session_connected_since: Dict[int, float] = {}
         self.session_last_activity: Dict[int, float] = {}
         self.session_failures: Dict[int, int] = {}
@@ -841,9 +847,12 @@ class ReverseDialer:
         self.circuit_breaker_until = 0.0
         self.target_connections = max(1, int(self.tunnel_config.connections or 1))
         self.next_session_id = 1
-        self._last_total_bytes = 0
+        self._last_user_bytes = 0
         self._last_throughput_check = time.monotonic()
-        self._last_activity_at = time.monotonic()
+        now = time.monotonic()
+        self.last_user_activity_at = now
+        self.last_channel_open_at = now
+        self.last_channel_close_at = now
 
     def record_session_bytes(self, session_id: int, bytes_in: int = 0, bytes_out: int = 0):
         now = time.monotonic()
@@ -853,17 +862,27 @@ class ReverseDialer:
             self.session_bytes_out[session_id] = self.session_bytes_out.get(session_id, 0) + bytes_out
         if bytes_in or bytes_out:
             self.session_last_activity[session_id] = now
-            self._last_activity_at = now
+
+    def record_user_bytes(self, session_id: int, bytes_in: int = 0, bytes_out: int = 0):
+        now = time.monotonic()
+        if bytes_in:
+            self.session_user_bytes_in[session_id] = self.session_user_bytes_in.get(session_id, 0) + bytes_in
+        if bytes_out:
+            self.session_user_bytes_out[session_id] = self.session_user_bytes_out.get(session_id, 0) + bytes_out
+        if bytes_in or bytes_out:
+            self.session_last_activity[session_id] = now
+            self.last_user_activity_at = now
 
     def record_channel_open(self, session_id: int):
         self.session_active_channels[session_id] = self.session_active_channels.get(session_id, 0) + 1
         self.session_last_activity[session_id] = time.monotonic()
-        self._last_activity_at = self.session_last_activity[session_id]
+        self.last_channel_open_at = self.session_last_activity[session_id]
 
     def record_channel_close(self, session_id: int):
         current = self.session_active_channels.get(session_id, 0)
         self.session_active_channels[session_id] = max(0, current - 1)
         self.session_last_activity[session_id] = time.monotonic()
+        self.last_channel_close_at = self.session_last_activity[session_id]
 
     def record_session_connected(self, session_id: int):
         now = time.monotonic()
@@ -872,6 +891,8 @@ class ReverseDialer:
         self.session_active_channels.setdefault(session_id, 0)
         self.session_bytes_in.setdefault(session_id, 0)
         self.session_bytes_out.setdefault(session_id, 0)
+        self.session_user_bytes_in.setdefault(session_id, 0)
+        self.session_user_bytes_out.setdefault(session_id, 0)
 
     def record_session_disconnected(self, session_id: int):
         self.session_connected_since.pop(session_id, None)
@@ -885,6 +906,9 @@ class ReverseDialer:
 
     def total_bytes(self) -> int:
         return sum(self.session_bytes_in.values()) + sum(self.session_bytes_out.values())
+
+    def total_user_bytes(self) -> int:
+        return sum(self.session_user_bytes_in.values()) + sum(self.session_user_bytes_out.values())
 
     def record_connect_failure(self, session_id: int):
         now = time.monotonic()
@@ -913,10 +937,10 @@ class ReverseDialer:
 
     def _recent_bytes_per_second(self) -> float:
         now = time.monotonic()
-        total = self.total_bytes()
+        total = self.total_user_bytes()
         elapsed = max(0.001, now - self._last_throughput_check)
-        rate = (total - self._last_total_bytes) / elapsed
-        self._last_total_bytes = total
+        rate = (total - self._last_user_bytes) / elapsed
+        self._last_user_bytes = total
         self._last_throughput_check = now
         return max(0.0, rate)
 
@@ -928,6 +952,11 @@ class ReverseDialer:
         rate = self._recent_bytes_per_second()
         active_channels = self.total_active_channels()
         reason = None
+        idle_for = min(
+            now - self.last_user_activity_at,
+            now - self.last_channel_close_at,
+            now - self.last_channel_open_at,
+        )
 
         if (
             active_channels >= int(self.tunnel_config.scale_up_active_channels)
@@ -938,20 +967,26 @@ class ReverseDialer:
         elif (
             self.target_connections > min_conn
             and active_channels == 0
-            and now - self._last_activity_at >= float(self.tunnel_config.scale_down_idle_seconds)
+            and idle_for >= float(self.tunnel_config.scale_down_idle_seconds)
         ):
             self.target_connections = max(min_conn, self.target_connections - 1)
             reason = 'idle'
 
         if self.target_connections != old_target:
             direction = 'up' if self.target_connections > old_target else 'down'
-            logger.info(f"Reverse adaptive scale {direction}: target={self.target_connections} reason={reason}")
+            if direction == 'down':
+                logger.info(
+                    f"Reverse adaptive scale down: target={self.target_connections} "
+                    f"reason={reason} idle_for={idle_for:.0f}s"
+                )
+            else:
+                logger.info(f"Reverse adaptive scale up: target={self.target_connections} reason={reason}")
         return self.target_connections, reason
 
     def choose_idle_sessions_to_close(self, count: int) -> Set[int]:
         candidates = [
             (
-                self.session_bytes_in.get(session_id, 0) + self.session_bytes_out.get(session_id, 0),
+                self.session_user_bytes_in.get(session_id, 0) + self.session_user_bytes_out.get(session_id, 0),
                 self.session_last_activity.get(session_id, 0.0),
                 session_id,
             )
@@ -977,7 +1012,7 @@ class ReverseDialer:
                 continue
             threshold = base_age + random.uniform(0, jitter) if jitter else base_age
             if now - connected_since >= threshold:
-                recent_bytes = self.session_bytes_in.get(session_id, 0) + self.session_bytes_out.get(session_id, 0)
+                recent_bytes = self.session_user_bytes_in.get(session_id, 0) + self.session_user_bytes_out.get(session_id, 0)
                 candidates.append((recent_bytes, connected_since, session_id))
         candidates.sort()
         return {session_id for _, _, session_id in candidates[:max_count]}
@@ -1027,8 +1062,9 @@ class ReverseDialer:
             f"Reverse status: mode=adaptive min={self.tunnel_config.min_connections} "
             f"max={self.tunnel_config.max_connections} target={self.target_connections} "
             f"active={self.active_session_count()} active_channels={self.total_active_channels()} "
-            f"failures={failures} bytes_in={sum(self.session_bytes_in.values())} "
-            f"bytes_out={sum(self.session_bytes_out.values())}"
+            f"failures={failures} user_bytes_in={sum(self.session_user_bytes_in.values())} "
+            f"user_bytes_out={sum(self.session_user_bytes_out.values())} "
+            f"bytes_in={sum(self.session_bytes_in.values())} bytes_out={sum(self.session_bytes_out.values())}"
         )
 
     def _create_ssl_context(self) -> ssl.SSLContext:
