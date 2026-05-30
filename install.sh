@@ -60,6 +60,16 @@ SOCKS_HOST="127.0.0.1"
 SOCKS_PORT="1080"
 CONNECTIONS="1"
 CONNECTIONS_SET=0
+ADAPTIVE_CONNECTIONS=0
+ADAPTIVE_CONNECTIONS_SET=0
+MIN_CONNECTIONS="8"
+MIN_CONNECTIONS_SET=0
+MAX_CONNECTIONS="20"
+MAX_CONNECTIONS_SET=0
+SCALE_DOWN_IDLE_SECONDS="300"
+SCALE_DOWN_IDLE_SECONDS_SET=0
+IDLE_SESSION_RECYCLE=0
+IDLE_SESSION_RECYCLE_SET=0
 PERFORMANCE_PROFILE="balanced"
 PERFORMANCE_PROFILE_SET=0
 PRODUCTION_REVERSE_TUNING=0
@@ -143,6 +153,14 @@ Reverse mode options:
   --export-reverse-package     Export VPS reverse-dial bundle from Access Node
   --include-reverse-secret     Include reverse.secret in exported bundle
   --connections N             Reverse tunnel sessions for reverse-dial (fresh reverse default: 4)
+  --adaptive-connections      Start min reverse sessions and scale up to max under load
+  --no-adaptive-connections   Fixed reverse sessions using tunnel.connections
+  --fixed-connections         Alias for --no-adaptive-connections
+  --min-connections N         Adaptive minimum sessions (default: 8)
+  --max-connections N         Adaptive maximum sessions (default: 20)
+  --scale-down-idle-seconds N Adaptive idle time before scaling down (default: 300)
+  --idle-session-recycle      Recycle only idle sessions, disabled by default
+  --no-idle-session-recycle   Disable idle session recycle
   --performance-profile MODE  compatibility|balanced|throughput (default: balanced)
   --production-reverse-tuning Apply tested reverse defaults: throughput profile and 20 reverse-dial sessions
 
@@ -207,6 +225,41 @@ parse_args() {
                 CONNECTIONS="${2:-}"
                 CONNECTIONS_SET=1
                 shift 2
+                ;;
+            --adaptive-connections)
+                ADAPTIVE_CONNECTIONS=1
+                ADAPTIVE_CONNECTIONS_SET=1
+                shift
+                ;;
+            --no-adaptive-connections|--fixed-connections)
+                ADAPTIVE_CONNECTIONS=0
+                ADAPTIVE_CONNECTIONS_SET=1
+                shift
+                ;;
+            --min-connections)
+                MIN_CONNECTIONS="${2:-}"
+                MIN_CONNECTIONS_SET=1
+                shift 2
+                ;;
+            --max-connections)
+                MAX_CONNECTIONS="${2:-}"
+                MAX_CONNECTIONS_SET=1
+                shift 2
+                ;;
+            --scale-down-idle-seconds)
+                SCALE_DOWN_IDLE_SECONDS="${2:-}"
+                SCALE_DOWN_IDLE_SECONDS_SET=1
+                shift 2
+                ;;
+            --idle-session-recycle)
+                IDLE_SESSION_RECYCLE=1
+                IDLE_SESSION_RECYCLE_SET=1
+                shift
+                ;;
+            --no-idle-session-recycle)
+                IDLE_SESSION_RECYCLE=0
+                IDLE_SESSION_RECYCLE_SET=1
+                shift
                 ;;
             --performance-profile)
                 PERFORMANCE_PROFILE="${2:-}"
@@ -408,6 +461,16 @@ apply_production_reverse_tuning() {
         CONNECTIONS="20"
         CONNECTIONS_SET=1
     fi
+    if [ "$MODE" = "reverse-dial" ] && [ "$ADAPTIVE_CONNECTIONS_SET" -eq 0 ]; then
+        ADAPTIVE_CONNECTIONS=1
+        ADAPTIVE_CONNECTIONS_SET=1
+    fi
+    if [ "$MODE" = "reverse-dial" ] && [ "$MIN_CONNECTIONS_SET" -eq 0 ]; then
+        MIN_CONNECTIONS="8"
+    fi
+    if [ "$MODE" = "reverse-dial" ] && [ "$MAX_CONNECTIONS_SET" -eq 0 ]; then
+        MAX_CONNECTIONS="20"
+    fi
 }
 
 check_root() {
@@ -580,16 +643,31 @@ validate_port_value() {
 
 validate_connections_value() {
     local value="$1"
+    local name="${2:---connections}"
     if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ]; then
-        print_error "--connections must be an integer >= 1"
+        print_error "$name must be an integer >= 1"
         exit 1
     fi
     if [ "$value" -gt 24 ]; then
-        print_warn "--connections $value is above the recommended tested range. Values above 24 can increase noise and may hurt upload or reliability."
-        if [ "$ASSUME_YES" -ne 1 ] && ! confirm "Continue with --connections $value?"; then
-            print_error "Install cancelled because --connections $value was not confirmed"
+        print_warn "$name $value is above the recommended tested range. Values above 24 can increase noise and may hurt upload or reliability."
+        if [ "$ASSUME_YES" -ne 1 ] && ! confirm "Continue with $name $value?"; then
+            print_error "Install cancelled because $name $value was not confirmed"
             exit 1
         fi
+    fi
+}
+
+validate_adaptive_connection_values() {
+    validate_connections_value "$CONNECTIONS" "--connections"
+    validate_connections_value "$MIN_CONNECTIONS" "--min-connections"
+    validate_connections_value "$MAX_CONNECTIONS" "--max-connections"
+    if [ "$MAX_CONNECTIONS" -lt "$MIN_CONNECTIONS" ]; then
+        print_error "--max-connections must be >= --min-connections"
+        exit 1
+    fi
+    if ! [[ "$SCALE_DOWN_IDLE_SECONDS" =~ ^[0-9]+$ ]] || [ "$SCALE_DOWN_IDLE_SECONDS" -lt 1 ]; then
+        print_error "--scale-down-idle-seconds must be an integer >= 1"
+        exit 1
     fi
 }
 
@@ -1005,7 +1083,7 @@ preflight_role_values() {
     validate_port_value "$LISTEN_PORT" "--listen-port"
     validate_port_value "$SERVER_PORT" "--server-port"
     validate_port_value "$SOCKS_PORT" "--socks-port"
-    validate_connections_value "$CONNECTIONS"
+    validate_adaptive_connection_values
     validate_performance_profile
     if [ "$PRODUCTION_REVERSE_TUNING" -eq 1 ] && { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; }; then
         print_info "Production reverse tuning: enabled"
@@ -1013,6 +1091,10 @@ preflight_role_values() {
     print_info "Performance profile: $PERFORMANCE_PROFILE"
     if [ "$MODE" = "reverse-dial" ]; then
         print_info "Reverse tunnel sessions: $CONNECTIONS"
+        print_info "Adaptive reverse sessions: $([ "$ADAPTIVE_CONNECTIONS" -eq 1 ] && echo enabled || echo disabled)"
+        if [ "$ADAPTIVE_CONNECTIONS" -eq 1 ]; then
+            print_info "Adaptive session range: min=$MIN_CONNECTIONS max=$MAX_CONNECTIONS"
+        fi
     fi
 
     if [ "$MODE" = "reverse-listen" ]; then
@@ -1127,11 +1209,16 @@ update_existing_performance_profile() {
         print_info "Dry-run: would set performance.profile=$PERFORMANCE_PROFILE in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$PERFORMANCE_PROFILE" "$CONNECTIONS" "$CONNECTIONS_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$PERFORMANCE_PROFILE" "$CONNECTIONS" "$CONNECTIONS_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
-config_path, profile, connections, connections_set = sys.argv[1:5]
+(
+    config_path, profile, connections, connections_set,
+    adaptive, adaptive_set, min_connections, min_set,
+    max_connections, max_set, scale_down_idle, scale_down_set,
+    idle_recycle, idle_recycle_set,
+) = sys.argv[1:15]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1139,8 +1226,50 @@ data.setdefault('performance', {})['profile'] = profile
 
 tunnel = data.setdefault('tunnel', {})
 tunnel.setdefault('connect_timeout', 10)
+tunnel.setdefault('adaptive_connections', False)
+tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('max_connections', 20)
+tunnel.setdefault('scale_up_active_channels', 6)
+tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('session_start_interval_seconds', 2)
+tunnel.setdefault('session_start_jitter_seconds', 5)
+tunnel.setdefault('reconnect_global_backoff', True)
+tunnel.setdefault('reconnect_circuit_breaker_failures', 10)
+tunnel.setdefault('reconnect_circuit_breaker_window_seconds', 120)
+tunnel.setdefault('reconnect_circuit_breaker_cooldown', 300)
+tunnel.setdefault('idle_session_recycle', False)
+tunnel.setdefault('idle_session_recycle_min_age_seconds', 3600)
+tunnel.setdefault('idle_session_recycle_jitter_seconds', 900)
+tunnel.setdefault('idle_session_recycle_max_per_cycle', 1)
 if connections_set == '1':
     tunnel['connections'] = int(connections)
+if adaptive_set == '1':
+    tunnel['adaptive_connections'] = adaptive == '1'
+if min_set == '1':
+    tunnel['min_connections'] = int(min_connections)
+if max_set == '1':
+    tunnel['max_connections'] = int(max_connections)
+if scale_down_set == '1':
+    tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
+if idle_recycle_set == '1':
+    tunnel['idle_session_recycle'] = idle_recycle == '1'
+tunnel.setdefault('adaptive_connections', False)
+tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('max_connections', 20)
+tunnel.setdefault('scale_up_active_channels', 6)
+tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('session_start_interval_seconds', 2)
+tunnel.setdefault('session_start_jitter_seconds', 5)
+tunnel.setdefault('reconnect_global_backoff', True)
+tunnel.setdefault('reconnect_circuit_breaker_failures', 10)
+tunnel.setdefault('reconnect_circuit_breaker_window_seconds', 120)
+tunnel.setdefault('reconnect_circuit_breaker_cooldown', 300)
+tunnel.setdefault('idle_session_recycle', False)
+tunnel.setdefault('idle_session_recycle_min_age_seconds', 3600)
+tunnel.setdefault('idle_session_recycle_jitter_seconds', 900)
+tunnel.setdefault('idle_session_recycle_max_per_cycle', 1)
 
 metrics = data.setdefault('metrics', {})
 metrics.setdefault('enabled', True)
@@ -1161,6 +1290,48 @@ transport.setdefault('socket_recv_buffer', 0)
 transport.setdefault('tcp_nodelay', True)
 transport.setdefault('tcp_keepalive', True)
 transport.setdefault('pending_buffer_limit', 1048576)
+
+with open(config_path, 'w', encoding='utf-8') as f:
+    yaml.safe_dump(data, f, sort_keys=False)
+PY
+    chmod 600 "$config_path"
+    return 0
+}
+
+update_existing_adaptive_settings() {
+    local config_path="$1"
+    if [ "$ADAPTIVE_CONNECTIONS_SET" -ne 1 ] && [ "$MIN_CONNECTIONS_SET" -ne 1 ] && [ "$MAX_CONNECTIONS_SET" -ne 1 ] && [ "$SCALE_DOWN_IDLE_SECONDS_SET" -ne 1 ] && [ "$IDLE_SESSION_RECYCLE_SET" -ne 1 ]; then
+        return 1
+    fi
+    print_step "Updating adaptive reverse session settings in existing config"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_info "Dry-run: would update adaptive reverse settings in $config_path"
+        return 0
+    fi
+    "$PYTHON_BIN" - "$config_path" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
+import sys
+import yaml
+
+(
+    config_path, adaptive, adaptive_set, min_connections, min_set,
+    max_connections, max_set, scale_down_idle, scale_down_set,
+    idle_recycle, idle_recycle_set,
+) = sys.argv[1:12]
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    data = yaml.safe_load(f) or {}
+
+tunnel = data.setdefault('tunnel', {})
+if adaptive_set == '1':
+    tunnel['adaptive_connections'] = adaptive == '1'
+if min_set == '1':
+    tunnel['min_connections'] = int(min_connections)
+if max_set == '1':
+    tunnel['max_connections'] = int(max_connections)
+if scale_down_set == '1':
+    tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
+if idle_recycle_set == '1':
+    tunnel['idle_session_recycle'] = idle_recycle == '1'
 
 with open(config_path, 'w', encoding='utf-8') as f:
     yaml.safe_dump(data, f, sort_keys=False)
@@ -1244,11 +1415,16 @@ update_existing_reverse_dial_migration() {
         print_info "Dry-run: would update reverse-dial runtime defaults in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
-config_path, reverse_port, reverse_port_set, connections, connections_set, profile, profile_set = sys.argv[1:8]
+(
+    config_path, reverse_port, reverse_port_set, connections, connections_set,
+    profile, profile_set, adaptive, adaptive_set, min_connections, min_set,
+    max_connections, max_set, scale_down_idle, scale_down_set,
+    idle_recycle, idle_recycle_set,
+) = sys.argv[1:18]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1261,6 +1437,32 @@ tunnel = data.setdefault('tunnel', {})
 tunnel.setdefault('connect_timeout', 10)
 if connections_set == '1':
     tunnel['connections'] = int(connections)
+if adaptive_set == '1':
+    tunnel['adaptive_connections'] = adaptive == '1'
+if min_set == '1':
+    tunnel['min_connections'] = int(min_connections)
+if max_set == '1':
+    tunnel['max_connections'] = int(max_connections)
+if scale_down_set == '1':
+    tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
+if idle_recycle_set == '1':
+    tunnel['idle_session_recycle'] = idle_recycle == '1'
+tunnel.setdefault('adaptive_connections', False)
+tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('max_connections', 20)
+tunnel.setdefault('scale_up_active_channels', 6)
+tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('session_start_interval_seconds', 2)
+tunnel.setdefault('session_start_jitter_seconds', 5)
+tunnel.setdefault('reconnect_global_backoff', True)
+tunnel.setdefault('reconnect_circuit_breaker_failures', 10)
+tunnel.setdefault('reconnect_circuit_breaker_window_seconds', 120)
+tunnel.setdefault('reconnect_circuit_breaker_cooldown', 300)
+tunnel.setdefault('idle_session_recycle', False)
+tunnel.setdefault('idle_session_recycle_min_age_seconds', 3600)
+tunnel.setdefault('idle_session_recycle_jitter_seconds', 900)
+tunnel.setdefault('idle_session_recycle_max_per_cycle', 1)
 
 if profile_set == '1':
     data.setdefault('performance', {})['profile'] = profile
@@ -1406,6 +1608,9 @@ write_reverse_listen_config() {
         if update_existing_performance_profile "$config_path"; then
             return
         fi
+        if update_existing_adaptive_settings "$config_path"; then
+            return
+        fi
         print_info "Existing config preserved: $config_path"
         return
     fi
@@ -1456,6 +1661,22 @@ EOF
 
 tunnel:
   connections: 1
+  adaptive_connections: $([ "$ADAPTIVE_CONNECTIONS" -eq 1 ] && echo true || echo false)
+  min_connections: $MIN_CONNECTIONS
+  max_connections: $MAX_CONNECTIONS
+  scale_up_active_channels: 6
+  scale_up_bytes_per_second: 524288
+  scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
+  session_start_interval_seconds: 2
+  session_start_jitter_seconds: 5
+  reconnect_global_backoff: true
+  reconnect_circuit_breaker_failures: 10
+  reconnect_circuit_breaker_window_seconds: 120
+  reconnect_circuit_breaker_cooldown: 300
+  idle_session_recycle: $([ "$IDLE_SESSION_RECYCLE" -eq 1 ] && echo true || echo false)
+  idle_session_recycle_min_age_seconds: 3600
+  idle_session_recycle_jitter_seconds: 900
+  idle_session_recycle_max_per_cycle: 1
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
@@ -1548,6 +1769,9 @@ write_reverse_dial_config() {
         if update_existing_performance_profile "$config_path"; then
             return
         fi
+        if update_existing_adaptive_settings "$config_path"; then
+            return
+        fi
         if update_existing_reverse_connections "$config_path"; then
             return
         fi
@@ -1606,6 +1830,22 @@ server:
 
 tunnel:
   connections: $CONNECTIONS
+  adaptive_connections: $([ "$ADAPTIVE_CONNECTIONS" -eq 1 ] && echo true || echo false)
+  min_connections: $MIN_CONNECTIONS
+  max_connections: $MAX_CONNECTIONS
+  scale_up_active_channels: 6
+  scale_up_bytes_per_second: 524288
+  scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
+  session_start_interval_seconds: 2
+  session_start_jitter_seconds: 5
+  reconnect_global_backoff: true
+  reconnect_circuit_breaker_failures: 10
+  reconnect_circuit_breaker_window_seconds: 120
+  reconnect_circuit_breaker_cooldown: 300
+  idle_session_recycle: $([ "$IDLE_SESSION_RECYCLE" -eq 1 ] && echo true || echo false)
+  idle_session_recycle_min_age_seconds: 3600
+  idle_session_recycle_jitter_seconds: 900
+  idle_session_recycle_max_per_cycle: 1
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
@@ -1685,6 +1925,22 @@ $ca_line
 
 tunnel:
   connections: $bundle_connections
+  adaptive_connections: true
+  min_connections: 8
+  max_connections: 20
+  scale_up_active_channels: 6
+  scale_up_bytes_per_second: 524288
+  scale_down_idle_seconds: 300
+  session_start_interval_seconds: 2
+  session_start_jitter_seconds: 5
+  reconnect_global_backoff: true
+  reconnect_circuit_breaker_failures: 10
+  reconnect_circuit_breaker_window_seconds: 120
+  reconnect_circuit_breaker_cooldown: 300
+  idle_session_recycle: false
+  idle_session_recycle_min_age_seconds: 3600
+  idle_session_recycle_jitter_seconds: 900
+  idle_session_recycle_max_per_cycle: 1
   keepalive_interval: 45
   keepalive_timeout: 120
   reconnect_initial_delay: 2
