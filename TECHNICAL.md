@@ -788,15 +788,30 @@ Iran-side Access Node:
 
 ### 💾 Memory Usage
 
-For reverse mode, a practical starting point is:
+For reverse mode, the final tested production target for this deployment is:
 
 ```yaml
 tunnel:
-  connections: 4
+  connections: 20
+
+performance:
+  profile: throughput
 ```
 
-The best value is network-dependent. Test 2, 4, and 8 sessions before choosing
-a production value.
+The best value is network-dependent. Connection-count guidance from real
+deployment testing:
+
+- `4`: conservative
+- `8`: improved aggregate throughput
+- `12`: good balance
+- `16`: high performance
+- `20`: recommended production value for this deployment
+- `24`: experimental; may improve download but can hurt upload and increase noise
+- `>24`: not recommended without explicit testing
+
+Port behavior also matters. In this deployment, `8443` performed better than
+`587`. The tunnel cannot exceed a bad raw path, and upload/download can behave
+differently.
 
 Stage 2.1 adds explicit health and accounting per reverse session:
 
@@ -823,7 +838,17 @@ The Access Node can emit periodic reverse status logs:
 metrics:
   enabled: true
   log_interval: 30
+  verbose: false
 ```
+
+By default, reverse status is concise:
+
+```text
+Reverse status: configured=20 active=20 active_channels=7 total_channels=134 failures=0 bytes_in=... bytes_out=...
+```
+
+Per-session metrics are logged only when `metrics.verbose: true` or debug
+logging is enabled.
 
 Destination logging is privacy-safe by default:
 
@@ -851,6 +876,11 @@ transport:
   pending_buffer_limit: 1048576
 ```
 
+Cloudflare and other public speed endpoints can rate-limit concurrent curl tests
+with HTTP `429` or tiny response sizes. Use raw `iperf3` port tests and mobile
+app tests alongside tunnel-level curl checks.
+```
+
 `performance.profile` only selects defaults for local read sizes, drain cadence,
 and optional socket buffers. Explicit `transport.*` keys override the profile.
 `read_chunk_size` is capped at 65535 because the active frame payload length is
@@ -871,6 +901,7 @@ Both client and server use Python's `asyncio` for efficient handling of multiple
 - In normal mode, the client role runs beside V2Ray or the application and exposes local SOCKS5.
 - In reverse mode, the Iran-side Access Node runs `client.py` with `client.mode: reverse-listen`; the VPS Exit Node runs `server.py` with `server.mode: reverse-dial`.
 - Reverse mode supports multiple VPS-to-Access tunnel sessions with `tunnel.connections`. New SOCKS channels use least-active-session selection. Existing channels on a failed session fail cleanly and new channels avoid the dead session.
+- The tested production target for this deployment is reverse port `8443`, `tunnel.connections: 20`, and `performance.profile: throughput`.
 - Reverse mode requires the Access Node reverse listener port to be reachable from the VPS. NAT/CGNAT requires port forwarding or a different rendezvous/relay design.
 - Reverse mode TLS uses the Access Node certificate. Let's Encrypt HTTP-01, DNS-01/manual, existing certificates, and private CA fallback are installer-supported.
 - `scripts/bootstrap.sh` is the supported GitHub entry point for fresh installs and upgrades. It downloads a selected branch/tag/ref, then delegates to `install.sh`.
