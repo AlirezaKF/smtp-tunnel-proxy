@@ -847,6 +847,8 @@ Stage 2.1 adds explicit health and accounting per reverse session:
 - `failure_count`
 - `bytes_in`
 - `bytes_out`
+- `user_bytes_in`
+- `user_bytes_out`
 - `connected_since`
 
 Session selection skips unauthenticated, non-writable, closing, or disconnected
@@ -867,11 +869,16 @@ metrics:
 By default, reverse status is concise:
 
 ```text
-Reverse status: mode=adaptive min=8 max=20 target=8 active=8 active_channels=0 failures=0 bytes_in=... bytes_out=...
+Reverse status: mode=adaptive min=8 max=20 target=8 active=8 active_channels=0 failures=0 user_bytes_in=... user_bytes_out=... bytes_in=... bytes_out=...
 ```
 
 Per-session metrics are logged only when `metrics.verbose: true` or debug
 logging is enabled.
+
+Adaptive idle detection uses only real user activity: DATA payload bytes,
+channel opens, and channel closes. Keepalive and control frames still increment
+diagnostic `bytes_in`/`bytes_out`, but they do not reset idle timers and do not
+trigger throughput-based scale-up.
 
 Destination logging is privacy-safe by default:
 
