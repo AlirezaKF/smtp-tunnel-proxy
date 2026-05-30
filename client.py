@@ -1110,18 +1110,29 @@ class ReverseAccessListener:
             await asyncio.sleep(interval)
             active_sessions, stats = await self.session_pool.snapshot()
             configured_sessions = max(int(self.tunnel_config.connections or 1), active_sessions)
+            total_active_channels = sum(stat.active_channels for stat in stats)
+            total_channels = sum(stat.total_channels for stat in stats)
+            total_failures = sum(stat.failure_count for stat in stats)
+            total_bytes_in = sum(stat.bytes_in for stat in stats)
+            total_bytes_out = sum(stat.bytes_out for stat in stats)
             parts = [
-                f"Reverse status: configured_sessions={configured_sessions}",
-                f"active_sessions={active_sessions}",
+                f"Reverse status: configured={configured_sessions}",
+                f"active={active_sessions}",
+                f"active_channels={total_active_channels}",
+                f"total_channels={total_channels}",
+                f"failures={total_failures}",
+                f"bytes_in={total_bytes_in}",
+                f"bytes_out={total_bytes_out}",
             ]
-            for stat in stats:
-                parts.append(
-                    f"session{stat.session_id}_active_channels={stat.active_channels} "
-                    f"session{stat.session_id}_total_channels={stat.total_channels} "
-                    f"session{stat.session_id}_bytes_in={stat.bytes_in} "
-                    f"session{stat.session_id}_bytes_out={stat.bytes_out} "
-                    f"session{stat.session_id}_failures={stat.failure_count}"
-                )
+            if self.metrics_config.verbose or logger.isEnabledFor(logging.DEBUG):
+                for stat in stats:
+                    parts.append(
+                        f"session{stat.session_id}_active_channels={stat.active_channels} "
+                        f"session{stat.session_id}_total_channels={stat.total_channels} "
+                        f"session{stat.session_id}_bytes_in={stat.bytes_in} "
+                        f"session{stat.session_id}_bytes_out={stat.bytes_out} "
+                        f"session{stat.session_id}_failures={stat.failure_count}"
+                    )
             logger.info(" ".join(parts))
 
 
