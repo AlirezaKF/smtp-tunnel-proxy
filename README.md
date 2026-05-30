@@ -132,6 +132,9 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --allowed-dialer-ip VPS_PUBLIC_IP \
   --username reverse1 \
   --secret-file /root/reverse.secret \
+  --adaptive-connections \
+  --min-connections 8 \
+  --max-connections 20 \
   --performance-profile throughput \
   --yes
 ```
@@ -153,6 +156,9 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --username reverse1 \
   --secret-file /root/reverse.secret \
   --connections 20 \
+  --adaptive-connections \
+  --min-connections 8 \
+  --max-connections 20 \
   --performance-profile throughput \
   --yes
 ```
@@ -183,6 +189,19 @@ Final tested production target for this deployment:
 ```yaml
 tunnel:
   connections: 20
+  adaptive_connections: true
+  min_connections: 8
+  max_connections: 20
+  scale_up_active_channels: 6
+  scale_up_bytes_per_second: 524288
+  scale_down_idle_seconds: 300
+  session_start_interval_seconds: 2
+  session_start_jitter_seconds: 5
+  reconnect_global_backoff: true
+  reconnect_circuit_breaker_failures: 10
+  reconnect_circuit_breaker_window_seconds: 120
+  reconnect_circuit_breaker_cooldown: 300
+  idle_session_recycle: false
   connect_timeout: 10
 
 performance:
@@ -206,7 +225,7 @@ transport:
   tcp_keepalive: true
 ```
 
-Raw port behavior matters. In this deployment, port `8443` tested better than `587`, and `20` reverse sessions gave the best balance seen so far. If `20` performs worse on another route, test `12`, `16`, and `24` and use the value that performs best.
+Raw port behavior matters. In this deployment, port `8443` tested better than `587`, and adaptive `8-20` sessions is the recommended daily production setting. Fixed `20` sessions gave the best always-on load performance but has a larger idle footprint. If maximum speed is required temporarily, use fixed `20`; if upload degrades, lower `max_connections` to `16`.
 
 Connection-count guidance from deployment testing:
 
@@ -217,6 +236,16 @@ Connection-count guidance from deployment testing:
 - `20`: recommended production value for this deployment
 - `24`: experimental; may improve download but can hurt upload and increase noise
 - `>24`: not recommended without explicit testing
+
+Fixed high-speed mode:
+
+```bash
+sudo bash ./install.sh --role server --mode reverse-dial \
+  --connections 20 \
+  --no-adaptive-connections \
+  --performance-profile throughput \
+  --migrate-config --non-interactive
+```
 
 Count session distribution on the VPS Exit Node:
 
@@ -376,6 +405,41 @@ sudo bash ./install.sh --role server --mode reverse-dial --production-reverse-tu
 ```
 
 `--production-reverse-tuning` sets `performance.profile: throughput`; for reverse-dial it also sets `tunnel.connections: 20` unless `--connections` was explicitly provided.
+
+---
+
+# VPS IP Change Without Reinstall
+
+Changing the foreign VPS public IP does not require reinstalling the tunnel. On the Access Node, update only `client.reverse.allowed_dialer_ips` in `/etc/smtp-tunnel/config.yaml`, then allow the new VPS IP in the firewall:
+
+```bash
+sudo ufw allow from NEW_VPS_IP to any port 8443 proto tcp
+sudo systemctl restart smtp-tunnel
+```
+
+Then restart the Exit Node service:
+
+```bash
+sudo systemctl restart smtp-tunnel
+```
+
+Verify:
+
+```bash
+sudo ss -tnp | grep ':8443'
+sudo journalctl -u smtp-tunnel -f | grep -iE 'Reverse status|disconnect|reconnect|failure'
+```
+
+Do not rewrite reverse domain, certificate paths, Let's Encrypt settings, username, secret file path, SOCKS host/port, or performance profile for an IP-only VPS change.
+
+Path checks:
+
+```bash
+nc -vz -w5 ACCESS_DOMAIN 8443
+sudo tcpdump -ni any host VPS_IP and port 8443
+```
+
+ICMP/ping alone is not conclusive.
 
 ---
 
