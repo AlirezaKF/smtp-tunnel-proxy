@@ -959,6 +959,12 @@ class TunnelConfig:
     scale_up_active_channels: int = 2
     scale_up_bytes_per_second: int = 131072
     scale_down_idle_seconds: float = 300.0
+    scale_down_noise_bytes: int = 65536
+    scale_down_noise_window_seconds: float = 300.0
+    short_channel_ignore_seconds: float = 2.0
+    short_channel_ignore_bytes: int = 65536
+    scale_up_min_channel_age_seconds: float = 2.0
+    scale_up_min_user_bytes: int = 65536
     session_start_interval_seconds: float = 2.0
     session_start_jitter_seconds: float = 5.0
     reconnect_global_backoff: bool = True
@@ -1281,6 +1287,30 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
         scale_down_idle_seconds=_as_float(
             tunnel_conf.get('scale_down_idle_seconds'), 300.0,
             'tunnel.scale_down_idle_seconds', minimum=1.0
+        ),
+        scale_down_noise_bytes=_as_int(
+            tunnel_conf.get('scale_down_noise_bytes'), 65536,
+            'tunnel.scale_down_noise_bytes', minimum=0
+        ),
+        scale_down_noise_window_seconds=_as_float(
+            tunnel_conf.get('scale_down_noise_window_seconds'), 300.0,
+            'tunnel.scale_down_noise_window_seconds', minimum=1.0
+        ),
+        short_channel_ignore_seconds=_as_float(
+            tunnel_conf.get('short_channel_ignore_seconds'), 2.0,
+            'tunnel.short_channel_ignore_seconds', minimum=0.0
+        ),
+        short_channel_ignore_bytes=_as_int(
+            tunnel_conf.get('short_channel_ignore_bytes'), 65536,
+            'tunnel.short_channel_ignore_bytes', minimum=0
+        ),
+        scale_up_min_channel_age_seconds=_as_float(
+            tunnel_conf.get('scale_up_min_channel_age_seconds'), 2.0,
+            'tunnel.scale_up_min_channel_age_seconds', minimum=0.0
+        ),
+        scale_up_min_user_bytes=_as_int(
+            tunnel_conf.get('scale_up_min_user_bytes'), 65536,
+            'tunnel.scale_up_min_user_bytes', minimum=0
         ),
         session_start_interval_seconds=_as_float(
             tunnel_conf.get('session_start_interval_seconds'), 2.0,
