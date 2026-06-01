@@ -798,6 +798,13 @@ tunnel:
   max_connections: 20
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
+  scale_down_idle_seconds: 300
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
 
 performance:
   profile: throughput
@@ -820,6 +827,13 @@ down after idle time. It never closes sessions with active channels. Fixed mode
 remains available by setting `adaptive_connections: false`; existing
 `connections: 20` deployments keep their old behavior unless adaptive mode is
 enabled.
+
+Adaptive decisions separate real user activity from the control/noise floor.
+Keepalive frames are excluded from user traffic, and short low-byte channels
+such as DNS/DoH resolves through SOCKS are classified as noise. Noise channels
+are still forwarded and counted in raw diagnostics, but they do not reset the
+long idle timer, do not trigger throughput scale-up, and do not keep the target
+session count at `max_connections`.
 
 Reconnect storm protection tracks failed reverse dial attempts in a rolling
 window. If failures exceed `reconnect_circuit_breaker_failures`, most sessions
