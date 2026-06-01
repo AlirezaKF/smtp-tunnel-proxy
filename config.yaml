@@ -81,6 +81,14 @@ tunnel:
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
   scale_down_idle_seconds: 300
+  # Noise floor controls: short DNS/DoH-style channels still pass normally,
+  # but do not keep adaptive reverse sessions scaled up.
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
   reconnect_global_backoff: true
@@ -173,6 +181,13 @@ smtp:
 #   max_connections: 20
 #   scale_up_active_channels: 2
 #   scale_up_bytes_per_second: 131072
+#   scale_down_idle_seconds: 300
+#   scale_down_noise_bytes: 65536
+#   scale_down_noise_window_seconds: 300
+#   short_channel_ignore_seconds: 2
+#   short_channel_ignore_bytes: 65536
+#   scale_up_min_channel_age_seconds: 2
+#   scale_up_min_user_bytes: 65536
 #
 # Exit Node / VPS (server.py):
 #
