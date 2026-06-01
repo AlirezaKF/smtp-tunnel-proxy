@@ -846,14 +846,18 @@ class ReverseDialer:
         self.session_failures: Dict[int, int] = {}
         self.failure_events = []
         self.circuit_breaker_until = 0.0
-        self.target_connections = max(1, int(self.tunnel_config.connections or 1))
+        self.target_connections = self._initial_target_connections()
         self.next_session_id = 1
         self._last_user_bytes = 0
         self._last_throughput_check = time.monotonic()
-        now = time.monotonic()
-        self.last_user_activity_at = now
-        self.last_channel_open_at = now
-        self.last_channel_close_at = now
+        self.last_user_activity_at = 0.0
+        self.last_channel_open_at = 0.0
+        self.last_channel_close_at = 0.0
+
+    def _initial_target_connections(self) -> int:
+        if self.tunnel_config.adaptive_connections:
+            return max(1, int(self.tunnel_config.min_connections or 1))
+        return max(1, int(self.tunnel_config.connections or 1))
 
     def record_session_bytes(self, session_id: int, bytes_in: int = 0, bytes_out: int = 0):
         now = time.monotonic()
@@ -948,6 +952,17 @@ class ReverseDialer:
         self._last_throughput_check = now
         return max(0.0, rate)
 
+    def has_recent_user_channel_activity(self, now: float) -> bool:
+        if self.total_active_channels() > 0:
+            return True
+        recent_window = max(1.0, min(5.0, float(self.tunnel_config.scale_down_idle_seconds or 300.0)))
+        if max(self.last_channel_open_at, self.last_channel_close_at) <= 0:
+            return False
+        return (
+            now - self.last_channel_close_at <= recent_window
+            and now - self.last_user_activity_at <= recent_window
+        )
+
     def update_adaptive_target(self, now: Optional[float] = None) -> Tuple[int, Optional[str]]:
         now = now or time.monotonic()
         min_conn = int(self.tunnel_config.min_connections)
@@ -955,6 +970,7 @@ class ReverseDialer:
         old_target = self.target_connections
         rate = self._recent_bytes_per_second()
         active_channels = self.total_active_channels()
+        has_recent_user_channel = self.has_recent_user_channel_activity(now)
         reason = None
         idle_for = min(
             now - self.last_user_activity_at,
@@ -963,11 +979,23 @@ class ReverseDialer:
         )
 
         if (
+            self.target_connections > min_conn
+            and active_channels == 0
+            and self.total_user_bytes() == 0
+            and not self.session_tasks
+        ):
+            self.target_connections = min_conn
+            reason = 'idle'
+
+        elif (
             active_channels >= int(self.tunnel_config.scale_up_active_channels)
-            or rate >= int(self.tunnel_config.scale_up_bytes_per_second)
+            or (
+                has_recent_user_channel
+                and rate >= int(self.tunnel_config.scale_up_bytes_per_second)
+            )
         ):
             self.target_connections = min(max_conn, max(min_conn, self.target_connections + 1))
-            reason = 'active_channels' if active_channels >= int(self.tunnel_config.scale_up_active_channels) else 'throughput'
+            reason = 'active_channels' if active_channels >= int(self.tunnel_config.scale_up_active_channels) else 'user_throughput'
         elif (
             self.target_connections > min_conn
             and active_channels == 0
@@ -984,7 +1012,13 @@ class ReverseDialer:
                     f"reason={reason} idle_for={idle_for:.0f}s"
                 )
             else:
-                logger.info(f"Reverse adaptive scale up: target={self.target_connections} reason={reason}")
+                if reason == 'user_throughput':
+                    logger.info(
+                        f"Reverse adaptive scale up: target={self.target_connections} "
+                        f"reason={reason} bps={rate:.0f} active_channels={active_channels}"
+                    )
+                else:
+                    logger.info(f"Reverse adaptive scale up: target={self.target_connections} reason={reason}")
         return self.target_connections, reason
 
     def choose_idle_sessions_to_close(self, count: int) -> Set[int]:
@@ -1278,6 +1312,8 @@ class ReverseDialer:
         min_conn = max(1, int(self.tunnel_config.min_connections))
         max_conn = max(min_conn, int(self.tunnel_config.max_connections))
         self.target_connections = min_conn
+        self._last_user_bytes = self.total_user_bytes()
+        self._last_throughput_check = time.monotonic()
         self.next_session_id = 1
         logger.info(
             f"Reverse dial adaptive sessions enabled: min={min_conn} max={max_conn} "
