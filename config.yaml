@@ -71,15 +71,15 @@ tunnel:
 
   # Number of reverse-dial tunnel sessions from VPS to Access Node.
   # Normal mode and generic examples default to 1.
-  # Reverse guidance: 4 conservative, 8 improved aggregate, 12 balanced,
-  # 16 high performance, 20 tested production target, 24 experimental.
+  # Reverse guidance: adaptive 4-20 is the current daily production target;
+  # fixed 20 is available for temporary maximum-speed testing.
   connections: 1
   # Adaptive reverse-dial mode starts fewer idle sessions and scales up under load.
   adaptive_connections: false
-  min_connections: 8
+  min_connections: 4
   max_connections: 20
-  scale_up_active_channels: 6
-  scale_up_bytes_per_second: 524288
+  scale_up_active_channels: 2
+  scale_up_bytes_per_second: 131072
   scale_down_idle_seconds: 300
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
@@ -150,7 +150,7 @@ smtp:
 #   socks_port: 1080
 #   reverse:
 #     listen_host: "0.0.0.0"
-#     listen_port: 8443
+#     listen_port: 587
 #     auth_username: "reverse1"
 #     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
 #     allowed_dialer_ips:
@@ -169,8 +169,10 @@ smtp:
 # tunnel:
 #   connections: 20  # tested production target for this deployment
 #   adaptive_connections: true
-#   min_connections: 8
+#   min_connections: 4
 #   max_connections: 20
+#   scale_up_active_channels: 2
+#   scale_up_bytes_per_second: 131072
 #
 # Exit Node / VPS (server.py):
 #
@@ -178,7 +180,7 @@ smtp:
 #   mode: reverse-dial
 #   reverse:
 #     access_host: "access.example.com"
-#     access_port: 8443
+#     access_port: 587
 #     tls_server_name: "access.example.com"
 #     auth_username: "reverse1"
 #     auth_secret_file: "/etc/smtp-tunnel/reverse.secret"
