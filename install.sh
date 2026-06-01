@@ -62,10 +62,14 @@ CONNECTIONS="1"
 CONNECTIONS_SET=0
 ADAPTIVE_CONNECTIONS=0
 ADAPTIVE_CONNECTIONS_SET=0
-MIN_CONNECTIONS="8"
+MIN_CONNECTIONS="4"
 MIN_CONNECTIONS_SET=0
 MAX_CONNECTIONS="20"
 MAX_CONNECTIONS_SET=0
+SCALE_UP_ACTIVE_CHANNELS="2"
+SCALE_UP_ACTIVE_CHANNELS_SET=0
+SCALE_UP_BYTES_PER_SECOND="131072"
+SCALE_UP_BYTES_PER_SECOND_SET=0
 SCALE_DOWN_IDLE_SECONDS="300"
 SCALE_DOWN_IDLE_SECONDS_SET=0
 IDLE_SESSION_RECYCLE=0
@@ -156,8 +160,10 @@ Reverse mode options:
   --adaptive-connections      Start min reverse sessions and scale up to max under load
   --no-adaptive-connections   Fixed reverse sessions using tunnel.connections
   --fixed-connections         Alias for --no-adaptive-connections
-  --min-connections N         Adaptive minimum sessions (default: 8)
+  --min-connections N         Adaptive minimum sessions (default: 4)
   --max-connections N         Adaptive maximum sessions (default: 20)
+  --scale-up-active-channels N Adaptive scale-up active channel threshold (default: 2)
+  --scale-up-bytes-per-second N Adaptive scale-up user throughput threshold (default: 131072)
   --scale-down-idle-seconds N Adaptive idle time before scaling down (default: 300)
   --idle-session-recycle      Recycle only idle sessions, disabled by default
   --no-idle-session-recycle   Disable idle session recycle
@@ -177,7 +183,7 @@ Examples:
   sudo bash ./install.sh --role server
   sudo bash ./install.sh --role server --hostname mail.example.com --listen-port 587 --service-name smtp-tunnel --non-interactive
   sudo bash ./install.sh --role client --server-host mail.example.com --server-port 587 --username alice --secret-file /root/alice.secret --ca-cert ./ca.crt --non-interactive
-  sudo bash ./install.sh --role server --mode reverse-dial --reverse-host access.example.com --reverse-port 8443 --connections 20 --performance-profile throughput --non-interactive
+  sudo bash ./install.sh --role server --mode reverse-dial --reverse-host access.example.com --reverse-port 587 --connections 20 --adaptive-connections --min-connections 4 --max-connections 20 --scale-up-active-channels 2 --scale-up-bytes-per-second 131072 --performance-profile throughput --non-interactive
 EOF
 }
 
@@ -244,6 +250,16 @@ parse_args() {
             --max-connections)
                 MAX_CONNECTIONS="${2:-}"
                 MAX_CONNECTIONS_SET=1
+                shift 2
+                ;;
+            --scale-up-active-channels)
+                SCALE_UP_ACTIVE_CHANNELS="${2:-}"
+                SCALE_UP_ACTIVE_CHANNELS_SET=1
+                shift 2
+                ;;
+            --scale-up-bytes-per-second)
+                SCALE_UP_BYTES_PER_SECOND="${2:-}"
+                SCALE_UP_BYTES_PER_SECOND_SET=1
                 shift 2
                 ;;
             --scale-down-idle-seconds)
@@ -466,10 +482,25 @@ apply_production_reverse_tuning() {
         ADAPTIVE_CONNECTIONS_SET=1
     fi
     if [ "$MODE" = "reverse-dial" ] && [ "$MIN_CONNECTIONS_SET" -eq 0 ]; then
-        MIN_CONNECTIONS="8"
+        MIN_CONNECTIONS="4"
+        MIN_CONNECTIONS_SET=1
     fi
     if [ "$MODE" = "reverse-dial" ] && [ "$MAX_CONNECTIONS_SET" -eq 0 ]; then
         MAX_CONNECTIONS="20"
+        MAX_CONNECTIONS_SET=1
+    fi
+    if [ "$MODE" = "reverse-dial" ] && [ "$SCALE_UP_ACTIVE_CHANNELS_SET" -eq 0 ]; then
+        SCALE_UP_ACTIVE_CHANNELS="2"
+        SCALE_UP_ACTIVE_CHANNELS_SET=1
+    fi
+    if [ "$MODE" = "reverse-dial" ] && [ "$SCALE_UP_BYTES_PER_SECOND_SET" -eq 0 ]; then
+        SCALE_UP_BYTES_PER_SECOND="131072"
+        SCALE_UP_BYTES_PER_SECOND_SET=1
+    fi
+    if { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; } && [ "$REVERSE_PORT_SET" -eq 0 ]; then
+        LISTEN_PORT="587"
+        SERVER_PORT="587"
+        REVERSE_PORT_SET=1
     fi
 }
 
@@ -663,6 +694,14 @@ validate_adaptive_connection_values() {
     validate_connections_value "$MAX_CONNECTIONS" "--max-connections"
     if [ "$MAX_CONNECTIONS" -lt "$MIN_CONNECTIONS" ]; then
         print_error "--max-connections must be >= --min-connections"
+        exit 1
+    fi
+    if ! [[ "$SCALE_UP_ACTIVE_CHANNELS" =~ ^[0-9]+$ ]] || [ "$SCALE_UP_ACTIVE_CHANNELS" -lt 1 ]; then
+        print_error "--scale-up-active-channels must be an integer >= 1"
+        exit 1
+    fi
+    if ! [[ "$SCALE_UP_BYTES_PER_SECOND" =~ ^[0-9]+$ ]] || [ "$SCALE_UP_BYTES_PER_SECOND" -lt 1 ]; then
+        print_error "--scale-up-bytes-per-second must be an integer >= 1"
         exit 1
     fi
     if ! [[ "$SCALE_DOWN_IDLE_SECONDS" =~ ^[0-9]+$ ]] || [ "$SCALE_DOWN_IDLE_SECONDS" -lt 1 ]; then
@@ -1209,16 +1248,17 @@ update_existing_performance_profile() {
         print_info "Dry-run: would set performance.profile=$PERFORMANCE_PROFILE in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$PERFORMANCE_PROFILE" "$CONNECTIONS" "$CONNECTIONS_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$PERFORMANCE_PROFILE" "$CONNECTIONS" "$CONNECTIONS_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
 (
     config_path, profile, connections, connections_set,
     adaptive, adaptive_set, min_connections, min_set,
-    max_connections, max_set, scale_down_idle, scale_down_set,
+    max_connections, max_set, scale_up_channels, scale_up_channels_set,
+    scale_up_bps, scale_up_bps_set, scale_down_idle, scale_down_set,
     idle_recycle, idle_recycle_set,
-) = sys.argv[1:15]
+) = sys.argv[1:19]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1227,10 +1267,10 @@ data.setdefault('performance', {})['profile'] = profile
 tunnel = data.setdefault('tunnel', {})
 tunnel.setdefault('connect_timeout', 10)
 tunnel.setdefault('adaptive_connections', False)
-tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('min_connections', 4)
 tunnel.setdefault('max_connections', 20)
-tunnel.setdefault('scale_up_active_channels', 6)
-tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_up_active_channels', 2)
+tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
@@ -1250,15 +1290,19 @@ if min_set == '1':
     tunnel['min_connections'] = int(min_connections)
 if max_set == '1':
     tunnel['max_connections'] = int(max_connections)
+if scale_up_channels_set == '1':
+    tunnel['scale_up_active_channels'] = int(scale_up_channels)
+if scale_up_bps_set == '1':
+    tunnel['scale_up_bytes_per_second'] = int(scale_up_bps)
 if scale_down_set == '1':
     tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
 if idle_recycle_set == '1':
     tunnel['idle_session_recycle'] = idle_recycle == '1'
 tunnel.setdefault('adaptive_connections', False)
-tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('min_connections', 4)
 tunnel.setdefault('max_connections', 20)
-tunnel.setdefault('scale_up_active_channels', 6)
-tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_up_active_channels', 2)
+tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
@@ -1300,7 +1344,7 @@ PY
 
 update_existing_adaptive_settings() {
     local config_path="$1"
-    if [ "$ADAPTIVE_CONNECTIONS_SET" -ne 1 ] && [ "$MIN_CONNECTIONS_SET" -ne 1 ] && [ "$MAX_CONNECTIONS_SET" -ne 1 ] && [ "$SCALE_DOWN_IDLE_SECONDS_SET" -ne 1 ] && [ "$IDLE_SESSION_RECYCLE_SET" -ne 1 ]; then
+    if [ "$ADAPTIVE_CONNECTIONS_SET" -ne 1 ] && [ "$MIN_CONNECTIONS_SET" -ne 1 ] && [ "$MAX_CONNECTIONS_SET" -ne 1 ] && [ "$SCALE_UP_ACTIVE_CHANNELS_SET" -ne 1 ] && [ "$SCALE_UP_BYTES_PER_SECOND_SET" -ne 1 ] && [ "$SCALE_DOWN_IDLE_SECONDS_SET" -ne 1 ] && [ "$IDLE_SESSION_RECYCLE_SET" -ne 1 ]; then
         return 1
     fi
     print_step "Updating adaptive reverse session settings in existing config"
@@ -1308,15 +1352,16 @@ update_existing_adaptive_settings() {
         print_info "Dry-run: would update adaptive reverse settings in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
 (
     config_path, adaptive, adaptive_set, min_connections, min_set,
-    max_connections, max_set, scale_down_idle, scale_down_set,
+    max_connections, max_set, scale_up_channels, scale_up_channels_set,
+    scale_up_bps, scale_up_bps_set, scale_down_idle, scale_down_set,
     idle_recycle, idle_recycle_set,
-) = sys.argv[1:12]
+) = sys.argv[1:16]
 
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
@@ -1328,6 +1373,10 @@ if min_set == '1':
     tunnel['min_connections'] = int(min_connections)
 if max_set == '1':
     tunnel['max_connections'] = int(max_connections)
+if scale_up_channels_set == '1':
+    tunnel['scale_up_active_channels'] = int(scale_up_channels)
+if scale_up_bps_set == '1':
+    tunnel['scale_up_bytes_per_second'] = int(scale_up_bps)
 if scale_down_set == '1':
     tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
 if idle_recycle_set == '1':
@@ -1415,16 +1464,17 @@ update_existing_reverse_dial_migration() {
         print_info "Dry-run: would update reverse-dial runtime defaults in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
 (
     config_path, reverse_port, reverse_port_set, connections, connections_set,
     profile, profile_set, adaptive, adaptive_set, min_connections, min_set,
-    max_connections, max_set, scale_down_idle, scale_down_set,
+    max_connections, max_set, scale_up_channels, scale_up_channels_set,
+    scale_up_bps, scale_up_bps_set, scale_down_idle, scale_down_set,
     idle_recycle, idle_recycle_set,
-) = sys.argv[1:18]
+) = sys.argv[1:22]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1443,15 +1493,19 @@ if min_set == '1':
     tunnel['min_connections'] = int(min_connections)
 if max_set == '1':
     tunnel['max_connections'] = int(max_connections)
+if scale_up_channels_set == '1':
+    tunnel['scale_up_active_channels'] = int(scale_up_channels)
+if scale_up_bps_set == '1':
+    tunnel['scale_up_bytes_per_second'] = int(scale_up_bps)
 if scale_down_set == '1':
     tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
 if idle_recycle_set == '1':
     tunnel['idle_session_recycle'] = idle_recycle == '1'
 tunnel.setdefault('adaptive_connections', False)
-tunnel.setdefault('min_connections', 8)
+tunnel.setdefault('min_connections', 4)
 tunnel.setdefault('max_connections', 20)
-tunnel.setdefault('scale_up_active_channels', 6)
-tunnel.setdefault('scale_up_bytes_per_second', 524288)
+tunnel.setdefault('scale_up_active_channels', 2)
+tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
@@ -1664,8 +1718,8 @@ tunnel:
   adaptive_connections: $([ "$ADAPTIVE_CONNECTIONS" -eq 1 ] && echo true || echo false)
   min_connections: $MIN_CONNECTIONS
   max_connections: $MAX_CONNECTIONS
-  scale_up_active_channels: 6
-  scale_up_bytes_per_second: 524288
+  scale_up_active_channels: $SCALE_UP_ACTIVE_CHANNELS
+  scale_up_bytes_per_second: $SCALE_UP_BYTES_PER_SECOND
   scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
@@ -1833,8 +1887,8 @@ tunnel:
   adaptive_connections: $([ "$ADAPTIVE_CONNECTIONS" -eq 1 ] && echo true || echo false)
   min_connections: $MIN_CONNECTIONS
   max_connections: $MAX_CONNECTIONS
-  scale_up_active_channels: 6
-  scale_up_bytes_per_second: 524288
+  scale_up_active_channels: $SCALE_UP_ACTIVE_CHANNELS
+  scale_up_bytes_per_second: $SCALE_UP_BYTES_PER_SECOND
   scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
@@ -1926,10 +1980,10 @@ $ca_line
 tunnel:
   connections: $bundle_connections
   adaptive_connections: true
-  min_connections: 8
+  min_connections: 4
   max_connections: 20
-  scale_up_active_channels: 6
-  scale_up_bytes_per_second: 524288
+  scale_up_active_channels: 2
+  scale_up_bytes_per_second: 131072
   scale_down_idle_seconds: 300
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
