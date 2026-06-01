@@ -1109,19 +1109,14 @@ class ReverseAccessListener:
         while True:
             await asyncio.sleep(interval)
             active_sessions, stats = await self.session_pool.snapshot()
-            configured_sessions = max(int(self.tunnel_config.connections or 1), active_sessions)
             total_active_channels = sum(stat.active_channels for stat in stats)
             total_channels = sum(stat.total_channels for stat in stats)
             total_failures = sum(stat.failure_count for stat in stats)
             total_bytes_in = sum(stat.bytes_in for stat in stats)
             total_bytes_out = sum(stat.bytes_out for stat in stats)
-            mode = 'adaptive' if self.tunnel_config.adaptive_connections else 'fixed'
             parts = [
-                f"Reverse status: mode={mode}",
-                f"min={self.tunnel_config.min_connections}",
-                f"max={self.tunnel_config.max_connections}",
-                f"target={configured_sessions}",
-                f"active={active_sessions}",
+                "Reverse status: role=access",
+                f"observed_active={active_sessions}",
                 f"active_channels={total_active_channels}",
                 f"total_channels={total_channels}",
                 f"failures={total_failures}",
