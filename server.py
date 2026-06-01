@@ -99,6 +99,24 @@ class Channel:
     connected: bool = False
 
 
+@dataclass
+class ReverseChannelStats:
+    session_id: int
+    channel_id: int
+    opened_at: float
+    host: str = ''
+    port: int = 0
+    closed_at: float = 0.0
+    user_bytes_in: int = 0
+    user_bytes_out: int = 0
+    counted_as_real: bool = False
+    logged_noise: bool = False
+
+    @property
+    def total_user_bytes(self) -> int:
+        return self.user_bytes_in + self.user_bytes_out
+
+
 # ============================================================================
 # Tunnel Session
 # ============================================================================
@@ -675,7 +693,7 @@ class ReverseExitSession:
                 )
                 self.channels[channel_id] = channel
                 if self.stats_callback:
-                    self.stats_callback.record_channel_open(self.session_id)
+                    self.stats_callback.record_channel_open(self.session_id, channel_id, host, port)
                 await self._send_frame(FRAME_CONNECT_OK, channel_id)
                 self.channel_tasks[channel_id] = asyncio.create_task(self._channel_reader(channel))
                 logger.info(f"[reverse session {self.session_id}] CONNECT success ch={channel_id}")
@@ -687,6 +705,12 @@ class ReverseExitSession:
             await self._send_frame(FRAME_CONNECT_FAIL, channel_id)
 
     async def _handle_data(self, channel_id: int, payload: bytes):
+        if self.stats_callback:
+            self.stats_callback.record_user_bytes(
+                self.session_id,
+                channel_id=channel_id,
+                bytes_in=len(payload),
+            )
         channel = self.channels.get(channel_id)
         if channel and channel.connected and channel.writer:
             try:
@@ -727,7 +751,11 @@ class ReverseExitSession:
                 if self.stats_callback:
                     self.stats_callback.record_session_bytes(self.session_id, bytes_out=len(frame))
                     if frame_type == FRAME_DATA:
-                        self.stats_callback.record_user_bytes(self.session_id, bytes_out=len(payload))
+                        self.stats_callback.record_user_bytes(
+                            self.session_id,
+                            channel_id=channel_id,
+                            bytes_out=len(payload),
+                        )
                 await self._drain_writer(self.writer, len(frame), is_data=(frame_type == FRAME_DATA))
         except FrameProtocolError as e:
             logger.error(f"[reverse session {self.session_id}] Refusing malformed frame: {e}")
@@ -790,7 +818,7 @@ class ReverseExitSession:
                 pass
         self.channels.pop(channel.channel_id, None)
         if self.stats_callback:
-            self.stats_callback.record_channel_close(self.session_id)
+            self.stats_callback.record_channel_close(self.session_id, channel.channel_id)
         if channel.writer:
             task = self.drain_tasks.pop(id(channel.writer), None)
             if task:
@@ -844,15 +872,23 @@ class ReverseDialer:
         self.session_connected_since: Dict[int, float] = {}
         self.session_last_activity: Dict[int, float] = {}
         self.session_failures: Dict[int, int] = {}
+        self.channel_stats: Dict[Tuple[int, int], ReverseChannelStats] = {}
+        self.session_real_user_bytes_in: Dict[int, int] = {}
+        self.session_real_user_bytes_out: Dict[int, int] = {}
+        self.noise_events = []
         self.failure_events = []
         self.circuit_breaker_until = 0.0
         self.target_connections = self._initial_target_connections()
         self.next_session_id = 1
-        self._last_user_bytes = 0
+        self._last_real_user_bytes = 0
         self._last_throughput_check = time.monotonic()
+        self._last_noise_block_log_at = 0.0
         self.last_user_activity_at = 0.0
         self.last_channel_open_at = 0.0
         self.last_channel_close_at = 0.0
+        self.last_real_user_activity_at = 0.0
+        self.last_real_channel_open_at = 0.0
+        self.last_real_channel_close_at = 0.0
 
     def _initial_target_connections(self) -> int:
         if self.tunnel_config.adaptive_connections:
@@ -868,7 +904,84 @@ class ReverseDialer:
         if bytes_in or bytes_out:
             self.session_last_activity[session_id] = now
 
-    def record_user_bytes(self, session_id: int, bytes_in: int = 0, bytes_out: int = 0):
+    def _channel_key(self, session_id: int, channel_id: int) -> Tuple[int, int]:
+        return (session_id, channel_id)
+
+    def _channel_is_real_candidate(self, stats: ReverseChannelStats, now: float) -> bool:
+        age = now - stats.opened_at
+        return (
+            age >= float(self.tunnel_config.scale_up_min_channel_age_seconds)
+            or stats.total_user_bytes >= int(self.tunnel_config.scale_up_min_user_bytes)
+        )
+
+    def _count_channel_as_real(self, stats: ReverseChannelStats, now: float):
+        if stats.counted_as_real:
+            return
+        stats.counted_as_real = True
+        if stats.user_bytes_in:
+            self.session_real_user_bytes_in[stats.session_id] = (
+                self.session_real_user_bytes_in.get(stats.session_id, 0) + stats.user_bytes_in
+            )
+        if stats.user_bytes_out:
+            self.session_real_user_bytes_out[stats.session_id] = (
+                self.session_real_user_bytes_out.get(stats.session_id, 0) + stats.user_bytes_out
+            )
+        self.last_real_user_activity_at = now
+        self.last_real_channel_open_at = max(self.last_real_channel_open_at, stats.opened_at)
+
+    def _record_real_user_delta(
+        self,
+        stats: ReverseChannelStats,
+        bytes_in: int,
+        bytes_out: int,
+        now: float,
+    ):
+        if not stats.counted_as_real:
+            return
+        if bytes_in:
+            self.session_real_user_bytes_in[stats.session_id] = (
+                self.session_real_user_bytes_in.get(stats.session_id, 0) + bytes_in
+            )
+        if bytes_out:
+            self.session_real_user_bytes_out[stats.session_id] = (
+                self.session_real_user_bytes_out.get(stats.session_id, 0) + bytes_out
+            )
+        if bytes_in or bytes_out:
+            self.last_real_user_activity_at = now
+
+    def _is_noise_channel(self, stats: ReverseChannelStats) -> bool:
+        closed_at = stats.closed_at or time.monotonic()
+        lifetime = closed_at - stats.opened_at
+        return (
+            lifetime <= float(self.tunnel_config.short_channel_ignore_seconds)
+            and stats.total_user_bytes <= int(self.tunnel_config.short_channel_ignore_bytes)
+            and self.total_active_channels() == 0
+        )
+
+    def _record_noise_event(self, stats: ReverseChannelStats, now: float):
+        self.noise_events.append((now, stats.total_user_bytes))
+        window = float(self.tunnel_config.scale_down_noise_window_seconds)
+        self.noise_events = [(t, b) for t, b in self.noise_events if now - t <= window]
+        if not stats.logged_noise:
+            logger.info(
+                f"Reverse adaptive ignored noise channel: channel={stats.channel_id} "
+                f"age={stats.closed_at - stats.opened_at:.1f}s bytes={stats.total_user_bytes}"
+            )
+            stats.logged_noise = True
+
+    def recent_noise_bytes(self, now: Optional[float] = None) -> int:
+        now = now or time.monotonic()
+        window = float(self.tunnel_config.scale_down_noise_window_seconds)
+        self.noise_events = [(t, b) for t, b in self.noise_events if now - t <= window]
+        return sum(b for _, b in self.noise_events)
+
+    def record_user_bytes(
+        self,
+        session_id: int,
+        channel_id: int = 0,
+        bytes_in: int = 0,
+        bytes_out: int = 0,
+    ):
         now = time.monotonic()
         if bytes_in:
             self.session_user_bytes_in[session_id] = self.session_user_bytes_in.get(session_id, 0) + bytes_in
@@ -877,17 +990,47 @@ class ReverseDialer:
         if bytes_in or bytes_out:
             self.session_last_activity[session_id] = now
             self.last_user_activity_at = now
+        stats = self.channel_stats.get(self._channel_key(session_id, channel_id))
+        if not stats:
+            return
+        stats.user_bytes_in += bytes_in
+        stats.user_bytes_out += bytes_out
+        if not stats.counted_as_real and self._channel_is_real_candidate(stats, now):
+            self._count_channel_as_real(stats, now)
+            return
+        self._record_real_user_delta(stats, bytes_in, bytes_out, now)
 
-    def record_channel_open(self, session_id: int):
+    def record_channel_open(self, session_id: int, channel_id: int = 0, host: str = '', port: int = 0):
         self.session_active_channels[session_id] = self.session_active_channels.get(session_id, 0) + 1
         self.session_last_activity[session_id] = time.monotonic()
         self.last_channel_open_at = self.session_last_activity[session_id]
+        self.channel_stats[self._channel_key(session_id, channel_id)] = ReverseChannelStats(
+            session_id=session_id,
+            channel_id=channel_id,
+            opened_at=self.last_channel_open_at,
+            host=host,
+            port=port,
+        )
 
-    def record_channel_close(self, session_id: int):
+    def record_channel_close(self, session_id: int, channel_id: int = 0):
         current = self.session_active_channels.get(session_id, 0)
         self.session_active_channels[session_id] = max(0, current - 1)
         self.session_last_activity[session_id] = time.monotonic()
         self.last_channel_close_at = self.session_last_activity[session_id]
+        stats = self.channel_stats.get(self._channel_key(session_id, channel_id))
+        if not stats:
+            return
+        stats.closed_at = self.last_channel_close_at
+        if not stats.counted_as_real and self._is_noise_channel(stats):
+            self._record_noise_event(stats, self.last_channel_close_at)
+            self.channel_stats.pop(self._channel_key(session_id, channel_id), None)
+            return
+        if not stats.counted_as_real:
+            self._count_channel_as_real(stats, self.last_channel_close_at)
+        self.last_real_channel_close_at = self.last_channel_close_at
+        if stats.total_user_bytes:
+            self.last_real_user_activity_at = self.last_channel_close_at
+        self.channel_stats.pop(self._channel_key(session_id, channel_id), None)
 
     def record_session_connected(self, session_id: int):
         now = time.monotonic()
@@ -898,10 +1041,14 @@ class ReverseDialer:
         self.session_bytes_out.setdefault(session_id, 0)
         self.session_user_bytes_in.setdefault(session_id, 0)
         self.session_user_bytes_out.setdefault(session_id, 0)
+        self.session_real_user_bytes_in.setdefault(session_id, 0)
+        self.session_real_user_bytes_out.setdefault(session_id, 0)
 
     def record_session_disconnected(self, session_id: int):
         self.session_connected_since.pop(session_id, None)
         self.session_active_channels[session_id] = 0
+        for key in [key for key in self.channel_stats if key[0] == session_id]:
+            self.channel_stats.pop(key, None)
 
     def active_session_count(self) -> int:
         return len(self.session_connected_since)
@@ -917,6 +1064,9 @@ class ReverseDialer:
 
     def total_user_bytes(self) -> int:
         return sum(self.session_user_bytes_in.values()) + sum(self.session_user_bytes_out.values())
+
+    def total_real_user_bytes(self) -> int:
+        return sum(self.session_real_user_bytes_in.values()) + sum(self.session_real_user_bytes_out.values())
 
     def record_connect_failure(self, session_id: int):
         now = time.monotonic()
@@ -945,22 +1095,32 @@ class ReverseDialer:
 
     def _recent_bytes_per_second(self) -> float:
         now = time.monotonic()
-        total = self.total_user_bytes()
+        total = self.total_real_user_bytes()
         elapsed = max(0.001, now - self._last_throughput_check)
-        rate = (total - self._last_user_bytes) / elapsed
-        self._last_user_bytes = total
+        rate = (total - self._last_real_user_bytes) / elapsed
+        self._last_real_user_bytes = total
         self._last_throughput_check = now
         return max(0.0, rate)
 
+    def active_real_channel_count(self, now: Optional[float] = None) -> int:
+        now = now or time.monotonic()
+        count = 0
+        for stats in self.channel_stats.values():
+            if stats.closed_at:
+                continue
+            if stats.counted_as_real or self._channel_is_real_candidate(stats, now):
+                count += 1
+        return count
+
     def has_recent_user_channel_activity(self, now: float) -> bool:
-        if self.total_active_channels() > 0:
+        if self.active_real_channel_count(now) > 0:
             return True
         recent_window = max(1.0, min(5.0, float(self.tunnel_config.scale_down_idle_seconds or 300.0)))
-        if max(self.last_channel_open_at, self.last_channel_close_at) <= 0:
+        if max(self.last_real_channel_open_at, self.last_real_channel_close_at) <= 0:
             return False
         return (
-            now - self.last_channel_close_at <= recent_window
-            and now - self.last_user_activity_at <= recent_window
+            now - self.last_real_channel_close_at <= recent_window
+            and now - self.last_real_user_activity_at <= recent_window
         )
 
     def update_adaptive_target(self, now: Optional[float] = None) -> Tuple[int, Optional[str]]:
@@ -970,32 +1130,36 @@ class ReverseDialer:
         old_target = self.target_connections
         rate = self._recent_bytes_per_second()
         active_channels = self.total_active_channels()
+        active_real_channels = self.active_real_channel_count(now)
         has_recent_user_channel = self.has_recent_user_channel_activity(now)
+        noise_bytes = self.recent_noise_bytes(now)
         reason = None
-        idle_for = min(
-            now - self.last_user_activity_at,
-            now - self.last_channel_close_at,
-            now - self.last_channel_open_at,
+        last_real_activity = max(
+            self.last_real_user_activity_at,
+            self.last_real_channel_close_at,
+            self.last_real_channel_open_at,
         )
+        idle_for = now - last_real_activity if last_real_activity > 0 else float('inf')
 
         if (
             self.target_connections > min_conn
             and active_channels == 0
-            and self.total_user_bytes() == 0
+            and self.total_real_user_bytes() == 0
             and not self.session_tasks
         ):
             self.target_connections = min_conn
             reason = 'idle'
 
         elif (
-            active_channels >= int(self.tunnel_config.scale_up_active_channels)
+            active_real_channels >= int(self.tunnel_config.scale_up_active_channels)
             or (
                 has_recent_user_channel
+                and self.total_real_user_bytes() >= int(self.tunnel_config.scale_up_min_user_bytes)
                 and rate >= int(self.tunnel_config.scale_up_bytes_per_second)
             )
         ):
             self.target_connections = min(max_conn, max(min_conn, self.target_connections + 1))
-            reason = 'active_channels' if active_channels >= int(self.tunnel_config.scale_up_active_channels) else 'user_throughput'
+            reason = 'active_channels' if active_real_channels >= int(self.tunnel_config.scale_up_active_channels) else 'user_throughput'
         elif (
             self.target_connections > min_conn
             and active_channels == 0
@@ -1003,10 +1167,25 @@ class ReverseDialer:
         ):
             self.target_connections = max(min_conn, self.target_connections - 1)
             reason = 'idle'
+        elif (
+            active_channels == 0
+            and self.total_user_bytes() > self.total_real_user_bytes()
+            and now - self._last_noise_block_log_at >= 30.0
+        ):
+            logger.info(
+                f"Reverse adaptive scale up blocked: reason=noise_only bytes={noise_bytes} "
+                f"active_channels={active_channels}"
+            )
+            self._last_noise_block_log_at = now
 
         if self.target_connections != old_target:
             direction = 'up' if self.target_connections > old_target else 'down'
             if direction == 'down':
+                if noise_bytes:
+                    logger.info(
+                        f"Reverse adaptive scale down allowed despite noise: "
+                        f"noise_bytes={noise_bytes} idle_for={idle_for:.0f}s"
+                    )
                 logger.info(
                     f"Reverse adaptive scale down: target={self.target_connections} "
                     f"reason={reason} idle_for={idle_for:.0f}s"
@@ -1107,8 +1286,11 @@ class ReverseDialer:
             f"max={self.tunnel_config.max_connections} target={self.target_connections} "
             f"active={self.active_session_count()} connecting={self.connecting_session_count()} "
             f"active_channels={self.total_active_channels()} "
-            f"failures={failures} user_bytes_in={sum(self.session_user_bytes_in.values())} "
-            f"user_bytes_out={sum(self.session_user_bytes_out.values())} "
+            f"failures={failures} user_bytes_in={sum(self.session_real_user_bytes_in.values())} "
+            f"user_bytes_out={sum(self.session_real_user_bytes_out.values())} "
+            f"noise_bytes={self.recent_noise_bytes()} "
+            f"raw_user_bytes_in={sum(self.session_user_bytes_in.values())} "
+            f"raw_user_bytes_out={sum(self.session_user_bytes_out.values())} "
             f"bytes_in={sum(self.session_bytes_in.values())} bytes_out={sum(self.session_bytes_out.values())}"
         )
 
@@ -1312,7 +1494,7 @@ class ReverseDialer:
         min_conn = max(1, int(self.tunnel_config.min_connections))
         max_conn = max(min_conn, int(self.tunnel_config.max_connections))
         self.target_connections = min_conn
-        self._last_user_bytes = self.total_user_bytes()
+        self._last_real_user_bytes = self.total_real_user_bytes()
         self._last_throughput_check = time.monotonic()
         self.next_session_id = 1
         logger.info(
