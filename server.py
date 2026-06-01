@@ -835,6 +835,7 @@ class ReverseDialer:
         self.logging_config = logging_config or LoggingConfig()
         self.transport_config = transport_config or TransportConfig()
         self.session_tasks: Dict[int, asyncio.Task] = {}
+        self.connecting_sessions: Set[int] = set()
         self.session_active_channels: Dict[int, int] = {}
         self.session_bytes_in: Dict[int, int] = {}
         self.session_bytes_out: Dict[int, int] = {}
@@ -900,6 +901,9 @@ class ReverseDialer:
 
     def active_session_count(self) -> int:
         return len(self.session_connected_since)
+
+    def connecting_session_count(self) -> int:
+        return len(self.connecting_sessions)
 
     def total_active_channels(self) -> int:
         return sum(self.session_active_channels.values())
@@ -1028,10 +1032,16 @@ class ReverseDialer:
         self.record_session_disconnected(session_id)
 
     async def start_session(self, session_id: int):
+        cap = int(self.tunnel_config.max_connections if self.tunnel_config.adaptive_connections else self.tunnel_config.connections)
+        if len(self.session_tasks) >= cap:
+            logger.info(f"Reverse session cap reached: cap={cap}; skipping new session")
+            return
         self.session_tasks[session_id] = asyncio.create_task(self.run_session_forever(session_id))
 
     async def reconcile_adaptive_sessions(self):
-        while len(self.session_tasks) < self.target_connections:
+        cap = int(self.tunnel_config.max_connections)
+        self.target_connections = min(self.target_connections, cap)
+        while len(self.session_tasks) < self.target_connections and len(self.session_tasks) < cap:
             session_id = self.next_session_id
             self.next_session_id += 1
             await self.start_session(session_id)
@@ -1059,9 +1069,10 @@ class ReverseDialer:
     def status_line(self) -> str:
         failures = sum(self.session_failures.values())
         return (
-            f"Reverse status: mode=adaptive min={self.tunnel_config.min_connections} "
+            f"Reverse status: role=exit mode=adaptive min={self.tunnel_config.min_connections} "
             f"max={self.tunnel_config.max_connections} target={self.target_connections} "
-            f"active={self.active_session_count()} active_channels={self.total_active_channels()} "
+            f"active={self.active_session_count()} connecting={self.connecting_session_count()} "
+            f"active_channels={self.total_active_channels()} "
             f"failures={failures} user_bytes_in={sum(self.session_user_bytes_in.values())} "
             f"user_bytes_out={sum(self.session_user_bytes_out.values())} "
             f"bytes_in={sum(self.session_bytes_in.values())} bytes_out={sum(self.session_bytes_out.values())}"
@@ -1179,10 +1190,16 @@ class ReverseDialer:
             f"Reverse dial session {session_id} connecting to "
             f"{self.reverse_config.access_host}:{self.reverse_config.access_port}"
         )
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self.reverse_config.access_host, self.reverse_config.access_port),
-            timeout=30.0,
-        )
+        self.connecting_sessions.add(session_id)
+        reader = None
+        writer = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.reverse_config.access_host, self.reverse_config.access_port),
+                timeout=30.0,
+            )
+        finally:
+            self.connecting_sessions.discard(session_id)
         apply_socket_options(writer, self.transport_config)
         try:
             if not await self._smtp_handshake(reader, writer):
