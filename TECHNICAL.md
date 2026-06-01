@@ -794,8 +794,10 @@ For reverse mode, the final tested production target for this deployment is:
 tunnel:
   connections: 20
   adaptive_connections: true
-  min_connections: 8
+  min_connections: 4
   max_connections: 20
+  scale_up_active_channels: 2
+  scale_up_bytes_per_second: 131072
 
 performance:
   profile: throughput
@@ -827,13 +829,16 @@ connectivity returns, adaptive mode ramps sessions gradually using
 by default and, when enabled, only recycles idle sessions one at a time by
 default.
 
-Port behavior also matters. In this deployment, `8443` performed better than
-`587`. The tunnel cannot exceed a bad raw path, and upload/download can behave
-differently. ICMP/ping alone is not conclusive; use TCP checks such as:
+Port behavior also matters. In the latest real tunnel curl tests, `587` matched
+the SMTP-like transport best. `2525` is a fallback, and `8443` remains usable
+but is no longer the current recommended default. Raw `iperf3` is not a reliable
+selector for this path because it can connect but pass no useful data while the
+actual tunnel still works. ICMP/ping alone is not conclusive; use TCP checks such
+as:
 
 ```bash
-nc -vz -w5 ACCESS_DOMAIN 8443
-sudo tcpdump -ni any host VPS_IP and port 8443
+nc -vz -w5 ACCESS_DOMAIN 587
+sudo tcpdump -ni any host VPS_IP and port 587
 ```
 
 Stage 2.1 adds explicit health and accounting per reverse session:
@@ -869,7 +874,7 @@ metrics:
 By default, reverse status is concise:
 
 ```text
-Reverse status: mode=adaptive min=8 max=20 target=8 active=8 active_channels=0 failures=0 user_bytes_in=... user_bytes_out=... bytes_in=... bytes_out=...
+Reverse status: role=exit mode=adaptive min=4 max=20 target=4 active=4 connecting=0 active_channels=0 failures=0 user_bytes_in=... user_bytes_out=... bytes_in=... bytes_out=...
 ```
 
 Per-session metrics are logged only when `metrics.verbose: true` or debug
@@ -931,7 +936,7 @@ Both client and server use Python's `asyncio` for efficient handling of multiple
 - In normal mode, the client role runs beside V2Ray or the application and exposes local SOCKS5.
 - In reverse mode, the Iran-side Access Node runs `client.py` with `client.mode: reverse-listen`; the VPS Exit Node runs `server.py` with `server.mode: reverse-dial`.
 - Reverse mode supports multiple VPS-to-Access tunnel sessions with `tunnel.connections`. New SOCKS channels use least-active-session selection. Existing channels on a failed session fail cleanly and new channels avoid the dead session.
-- The tested production target for this deployment is reverse port `8443`, `tunnel.connections: 20`, and `performance.profile: throughput`.
+- The tested production target for this deployment is reverse port `587`, `tunnel.connections: 20`, adaptive `min_connections: 4`, `max_connections: 20`, and `performance.profile: throughput`.
 - Reverse mode requires the Access Node reverse listener port to be reachable from the VPS. NAT/CGNAT requires port forwarding or a different rendezvous/relay design.
 - Reverse mode TLS uses the Access Node certificate. Let's Encrypt HTTP-01, DNS-01/manual, existing certificates, and private CA fallback are installer-supported.
 - `scripts/bootstrap.sh` is the supported GitHub entry point for fresh installs and upgrades. It downloads a selected branch/tag/ref, then delegates to `install.sh`.
