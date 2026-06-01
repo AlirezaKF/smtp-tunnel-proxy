@@ -199,6 +199,12 @@ tunnel:
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
   scale_down_idle_seconds: 300
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
   reconnect_global_backoff: true
@@ -228,6 +234,12 @@ transport:
   tcp_nodelay: true
   tcp_keepalive: true
 ```
+
+Adaptive mode treats very short, small channels as a noise floor. This is useful
+when DNS or DoH is intentionally routed through the local SOCKS listener: those
+channels are still forwarded normally and counted in diagnostics, but they do
+not by themselves scale the reverse pool to `max_connections` or block idle
+scale-down.
 
 Real tunnel tests matter more than raw `iperf3` for this path: `iperf3` can connect but pass no useful data while the tunnel still works. In recent tunnel curl tests, port `587` matched the SMTP-like transport best; `2525` is a fallback, and `8443` remains usable but is no longer the current recommended default. Adaptive `4-20` sessions is the recommended daily production setting. Fixed `20` sessions is useful for temporary maximum-speed testing but has a larger idle footprint. Avoid repeated heavy speedtests on a fresh IP/path; start with normal use for 30-60 minutes before stress testing.
 
