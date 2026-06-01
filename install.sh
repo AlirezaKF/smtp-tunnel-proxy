@@ -1272,6 +1272,12 @@ tunnel.setdefault('max_connections', 20)
 tunnel.setdefault('scale_up_active_channels', 2)
 tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('scale_down_noise_bytes', 65536)
+tunnel.setdefault('scale_down_noise_window_seconds', 300)
+tunnel.setdefault('short_channel_ignore_seconds', 2)
+tunnel.setdefault('short_channel_ignore_bytes', 65536)
+tunnel.setdefault('scale_up_min_channel_age_seconds', 2)
+tunnel.setdefault('scale_up_min_user_bytes', 65536)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
 tunnel.setdefault('reconnect_global_backoff', True)
@@ -1304,6 +1310,12 @@ tunnel.setdefault('max_connections', 20)
 tunnel.setdefault('scale_up_active_channels', 2)
 tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('scale_down_noise_bytes', 65536)
+tunnel.setdefault('scale_down_noise_window_seconds', 300)
+tunnel.setdefault('short_channel_ignore_seconds', 2)
+tunnel.setdefault('short_channel_ignore_bytes', 65536)
+tunnel.setdefault('scale_up_min_channel_age_seconds', 2)
+tunnel.setdefault('scale_up_min_user_bytes', 65536)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
 tunnel.setdefault('reconnect_global_backoff', True)
@@ -1420,6 +1432,12 @@ if profile_set == '1':
 
 tunnel = data.setdefault('tunnel', {})
 tunnel.setdefault('connect_timeout', 10)
+tunnel.setdefault('scale_down_noise_bytes', 65536)
+tunnel.setdefault('scale_down_noise_window_seconds', 300)
+tunnel.setdefault('short_channel_ignore_seconds', 2)
+tunnel.setdefault('short_channel_ignore_bytes', 65536)
+tunnel.setdefault('scale_up_min_channel_age_seconds', 2)
+tunnel.setdefault('scale_up_min_user_bytes', 65536)
 
 metrics = data.setdefault('metrics', {})
 metrics.setdefault('enabled', True)
@@ -1507,6 +1525,12 @@ tunnel.setdefault('max_connections', 20)
 tunnel.setdefault('scale_up_active_channels', 2)
 tunnel.setdefault('scale_up_bytes_per_second', 131072)
 tunnel.setdefault('scale_down_idle_seconds', 300)
+tunnel.setdefault('scale_down_noise_bytes', 65536)
+tunnel.setdefault('scale_down_noise_window_seconds', 300)
+tunnel.setdefault('short_channel_ignore_seconds', 2)
+tunnel.setdefault('short_channel_ignore_bytes', 65536)
+tunnel.setdefault('scale_up_min_channel_age_seconds', 2)
+tunnel.setdefault('scale_up_min_user_bytes', 65536)
 tunnel.setdefault('session_start_interval_seconds', 2)
 tunnel.setdefault('session_start_jitter_seconds', 5)
 tunnel.setdefault('reconnect_global_backoff', True)
@@ -1721,6 +1745,12 @@ tunnel:
   scale_up_active_channels: $SCALE_UP_ACTIVE_CHANNELS
   scale_up_bytes_per_second: $SCALE_UP_BYTES_PER_SECOND
   scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
   reconnect_global_backoff: true
@@ -1890,6 +1920,12 @@ tunnel:
   scale_up_active_channels: $SCALE_UP_ACTIVE_CHANNELS
   scale_up_bytes_per_second: $SCALE_UP_BYTES_PER_SECOND
   scale_down_idle_seconds: $SCALE_DOWN_IDLE_SECONDS
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
   reconnect_global_backoff: true
@@ -1985,6 +2021,12 @@ tunnel:
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
   scale_down_idle_seconds: 300
+  scale_down_noise_bytes: 65536
+  scale_down_noise_window_seconds: 300
+  short_channel_ignore_seconds: 2
+  short_channel_ignore_bytes: 65536
+  scale_up_min_channel_age_seconds: 2
+  scale_up_min_user_bytes: 65536
   session_start_interval_seconds: 2
   session_start_jitter_seconds: 5
   reconnect_global_backoff: true
