@@ -954,10 +954,10 @@ class TunnelConfig:
     connections: int = 1
     connect_timeout: float = 10.0
     adaptive_connections: bool = False
-    min_connections: int = 8
+    min_connections: int = 4
     max_connections: int = 20
-    scale_up_active_channels: int = 6
-    scale_up_bytes_per_second: int = 524288
+    scale_up_active_channels: int = 2
+    scale_up_bytes_per_second: int = 131072
     scale_down_idle_seconds: float = 300.0
     session_start_interval_seconds: float = 2.0
     session_start_jitter_seconds: float = 5.0
@@ -1263,7 +1263,7 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
             'tunnel.adaptive_connections'
         ),
         min_connections=_as_int(
-            tunnel_conf.get('min_connections'), 8,
+            tunnel_conf.get('min_connections'), 4,
             'tunnel.min_connections', minimum=1
         ),
         max_connections=_as_int(
@@ -1271,11 +1271,11 @@ def build_tunnel_config(config_data: dict) -> TunnelConfig:
             'tunnel.max_connections', minimum=1
         ),
         scale_up_active_channels=_as_int(
-            tunnel_conf.get('scale_up_active_channels'), 6,
+            tunnel_conf.get('scale_up_active_channels'), 2,
             'tunnel.scale_up_active_channels', minimum=1
         ),
         scale_up_bytes_per_second=_as_int(
-            tunnel_conf.get('scale_up_bytes_per_second'), 524288,
+            tunnel_conf.get('scale_up_bytes_per_second'), 131072,
             'tunnel.scale_up_bytes_per_second', minimum=1
         ),
         scale_down_idle_seconds=_as_float(
