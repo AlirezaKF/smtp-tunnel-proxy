@@ -133,8 +133,8 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --username reverse1 \
   --secret-file /root/reverse.secret \
   --adaptive-connections \
-  --min-connections 4 \
-  --max-connections 20 \
+  --min-connections 2 \
+  --max-connections 16 \
   --scale-up-active-channels 2 \
   --scale-up-bytes-per-second 131072 \
   --performance-profile throughput \
@@ -157,10 +157,10 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --tls-verify-mode system-ca \
   --username reverse1 \
   --secret-file /root/reverse.secret \
-  --connections 20 \
+  --connections 16 \
   --adaptive-connections \
-  --min-connections 4 \
-  --max-connections 20 \
+  --min-connections 2 \
+  --max-connections 16 \
   --scale-up-active-channels 2 \
   --scale-up-bytes-per-second 131072 \
   --performance-profile throughput \
@@ -192,13 +192,13 @@ Final tested production target for this deployment:
 
 ```yaml
 tunnel:
-  connections: 20
+  connections: 16
   adaptive_connections: true
-  min_connections: 4
-  max_connections: 20
+  min_connections: 2
+  max_connections: 16
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
-  scale_down_idle_seconds: 300
+  scale_down_idle_seconds: 180
   scale_down_noise_bytes: 65536
   scale_down_noise_window_seconds: 300
   short_channel_ignore_seconds: 2
@@ -212,6 +212,8 @@ tunnel:
   reconnect_circuit_breaker_window_seconds: 120
   reconnect_circuit_breaker_cooldown: 300
   idle_session_recycle: false
+  keepalive_interval: 90
+  keepalive_timeout: 240
   connect_timeout: 10
 
 performance:
@@ -241,15 +243,15 @@ channels are still forwarded normally and counted in diagnostics, but they do
 not by themselves scale the reverse pool to `max_connections` or block idle
 scale-down.
 
-Real tunnel tests matter more than raw `iperf3` for this path: `iperf3` can connect but pass no useful data while the tunnel still works. In recent tunnel curl tests, port `587` matched the SMTP-like transport best; `2525` is a fallback, and `8443` remains usable but is no longer the current recommended default. Adaptive `4-20` sessions is the recommended daily production setting. Fixed `20` sessions is useful for temporary maximum-speed testing but has a larger idle footprint. Avoid repeated heavy speedtests on a fresh IP/path; start with normal use for 30-60 minutes before stress testing.
+Real tunnel tests matter more than raw `iperf3` for this path: `iperf3` can connect but pass no useful data while the tunnel still works. In recent tunnel curl tests, port `587` matched the SMTP-like transport best; `2525` is a fallback, and `8443` remains usable but is no longer the current recommended default. Adaptive `2-16` sessions is the recommended quieter daily production setting. Fixed `20` sessions is useful for temporary maximum-speed testing but has a larger idle footprint. Avoid repeated heavy speedtests on a fresh IP/path; start with normal use for 30-60 minutes before stress testing.
 
 Connection-count guidance from deployment testing:
 
 - `4`: conservative
 - `8`: improved aggregate throughput
 - `12`: good balance
-- `16`: high performance
-- `20`: recommended production value for this deployment
+- `16`: current recommended production maximum for this deployment
+- `20`: temporary fixed maximum-speed testing; larger idle footprint
 - `24`: experimental; may improve download but can hurt upload and increase noise
 - `>24`: not recommended without explicit testing
 
@@ -353,7 +355,7 @@ Verify the production reverse session count:
 sudo ss -tnp | grep ':587' | wc -l
 ```
 
-Expected under load with `max_connections: 20` is up to `20`; idle adaptive daily mode should return toward `min_connections: 4`.
+Expected under load with `max_connections: 16` is up to `16`; idle adaptive daily mode should return toward `min_connections: 2`.
 
 Production status log:
 
@@ -361,12 +363,12 @@ Production status log:
 sudo journalctl -u smtp-tunnel -f | grep -iE 'Reverse status|disconnect|reconnect|failure'
 ```
 
-Expected steady state: `active=20` and `failures=0`.
+Expected idle steady state: `active=2` and `failures=0`. Under real load, adaptive mode can ramp toward `active=16`.
 
 Troubleshooting:
 
-- If user experience is slow, temporarily test fixed `20` or adaptive `min_connections: 6`, `max_connections: 20`.
-- If phone download is low but 20 sessions are active, the app may not use enough parallel flows.
+- If user experience is slow, temporarily test fixed `20` or adaptive `min_connections: 4`, `max_connections: 16`.
+- If phone download is low but 16 sessions are active, the app may not use enough parallel flows.
 - If upload is low, try lowering `max_connections` to `16`.
 - If `active` drops below the configured count, inspect firewall and reconnect logs.
 - If failures increase or the circuit breaker triggers, reduce `max_connections` and investigate the path/IP.
@@ -411,10 +413,10 @@ curl -fsSL https://raw.githubusercontent.com/AlirezaKF/smtp-tunnel-proxy/main/sc
   --repo AlirezaKF/smtp-tunnel-proxy \
   --ref main \
   --reverse-port 587 \
-  --connections 20 \
+  --connections 16 \
   --adaptive-connections \
-  --min-connections 4 \
-  --max-connections 20 \
+  --min-connections 2 \
+  --max-connections 16 \
   --scale-up-active-channels 2 \
   --scale-up-bytes-per-second 131072 \
   --performance-profile throughput \
@@ -430,7 +432,7 @@ You can also use the preset flag in reverse mode:
 sudo bash ./install.sh --role server --mode reverse-dial --production-reverse-tuning --migrate-config --non-interactive
 ```
 
-`--production-reverse-tuning` sets the current production reverse defaults: reverse port `587`, `performance.profile: throughput`, and for reverse-dial `connections: 20`, `adaptive_connections: true`, `min_connections: 4`, `max_connections: 20`, `scale_up_active_channels: 2`, and `scale_up_bytes_per_second: 131072` unless those values were explicitly provided.
+`--production-reverse-tuning` sets the current production reverse defaults: reverse port `587`, `performance.profile: throughput`, and for reverse-dial `connections: 16`, `adaptive_connections: true`, `min_connections: 2`, `max_connections: 16`, `scale_up_active_channels: 2`, `scale_up_bytes_per_second: 131072`, `scale_down_idle_seconds: 180`, `keepalive_interval: 90`, and `keepalive_timeout: 240` unless those values were explicitly provided.
 
 ---
 
@@ -839,8 +841,8 @@ Recommended fresh-install settings:
 
 ```yaml
 tunnel:
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: 90
+  keepalive_timeout: 240
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
