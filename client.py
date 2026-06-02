@@ -893,7 +893,10 @@ class ReverseAccessListener:
         self.transport_config = transport_config or TransportConfig()
         self.session_pool = ReverseSessionPool(self.logging_config)
         self.ssl_context = self._create_ssl_context()
-        self.allowed_ips = IPWhitelist(reverse_config.allowed_dialer_ips)
+        self.allowed_ips = IPWhitelist(
+            reverse_config.allowed_dialer_ips,
+            'client.reverse.allowed_dialer_ips',
+        )
 
     def _create_ssl_context(self) -> ssl.SSLContext:
         tls = self.reverse_config.tls
