@@ -72,6 +72,9 @@ SCALE_UP_BYTES_PER_SECOND="131072"
 SCALE_UP_BYTES_PER_SECOND_SET=0
 SCALE_DOWN_IDLE_SECONDS="300"
 SCALE_DOWN_IDLE_SECONDS_SET=0
+KEEPALIVE_INTERVAL="45"
+KEEPALIVE_TIMEOUT="120"
+KEEPALIVE_SET=0
 IDLE_SESSION_RECYCLE=0
 IDLE_SESSION_RECYCLE_SET=0
 PERFORMANCE_PROFILE="balanced"
@@ -168,7 +171,7 @@ Reverse mode options:
   --idle-session-recycle      Recycle only idle sessions, disabled by default
   --no-idle-session-recycle   Disable idle session recycle
   --performance-profile MODE  compatibility|balanced|throughput (default: balanced)
-  --production-reverse-tuning Apply tested reverse defaults: throughput profile and 20 reverse-dial sessions
+  --production-reverse-tuning Apply quieter tested reverse defaults: throughput profile and adaptive 2-16 sessions
 
 Upgrade / automation:
   --non-interactive            Do not prompt; fail if required values are missing
@@ -183,7 +186,7 @@ Examples:
   sudo bash ./install.sh --role server
   sudo bash ./install.sh --role server --hostname mail.example.com --listen-port 587 --service-name smtp-tunnel --non-interactive
   sudo bash ./install.sh --role client --server-host mail.example.com --server-port 587 --username alice --secret-file /root/alice.secret --ca-cert ./ca.crt --non-interactive
-  sudo bash ./install.sh --role server --mode reverse-dial --reverse-host access.example.com --reverse-port 587 --connections 20 --adaptive-connections --min-connections 4 --max-connections 20 --scale-up-active-channels 2 --scale-up-bytes-per-second 131072 --performance-profile throughput --non-interactive
+  sudo bash ./install.sh --role server --mode reverse-dial --reverse-host access.example.com --reverse-port 587 --connections 16 --adaptive-connections --min-connections 2 --max-connections 16 --scale-up-active-channels 2 --scale-up-bytes-per-second 131072 --performance-profile throughput --non-interactive
 EOF
 }
 
@@ -474,19 +477,19 @@ apply_production_reverse_tuning() {
     PERFORMANCE_PROFILE_SET=1
 
     if [ "$MODE" = "reverse-dial" ] && [ "$CONNECTIONS_SET" -eq 0 ]; then
-        CONNECTIONS="20"
+        CONNECTIONS="16"
         CONNECTIONS_SET=1
     fi
     if [ "$MODE" = "reverse-dial" ] && [ "$ADAPTIVE_CONNECTIONS_SET" -eq 0 ]; then
         ADAPTIVE_CONNECTIONS=1
         ADAPTIVE_CONNECTIONS_SET=1
     fi
-    if [ "$MODE" = "reverse-dial" ] && [ "$MIN_CONNECTIONS_SET" -eq 0 ]; then
-        MIN_CONNECTIONS="4"
+    if { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; } && [ "$MIN_CONNECTIONS_SET" -eq 0 ]; then
+        MIN_CONNECTIONS="2"
         MIN_CONNECTIONS_SET=1
     fi
-    if [ "$MODE" = "reverse-dial" ] && [ "$MAX_CONNECTIONS_SET" -eq 0 ]; then
-        MAX_CONNECTIONS="20"
+    if { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; } && [ "$MAX_CONNECTIONS_SET" -eq 0 ]; then
+        MAX_CONNECTIONS="16"
         MAX_CONNECTIONS_SET=1
     fi
     if [ "$MODE" = "reverse-dial" ] && [ "$SCALE_UP_ACTIVE_CHANNELS_SET" -eq 0 ]; then
@@ -497,6 +500,13 @@ apply_production_reverse_tuning() {
         SCALE_UP_BYTES_PER_SECOND="131072"
         SCALE_UP_BYTES_PER_SECOND_SET=1
     fi
+    if { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; } && [ "$SCALE_DOWN_IDLE_SECONDS_SET" -eq 0 ]; then
+        SCALE_DOWN_IDLE_SECONDS="180"
+        SCALE_DOWN_IDLE_SECONDS_SET=1
+    fi
+    KEEPALIVE_INTERVAL="90"
+    KEEPALIVE_TIMEOUT="240"
+    KEEPALIVE_SET=1
     if { [ "$MODE" = "reverse-listen" ] || [ "$MODE" = "reverse-dial" ]; } && [ "$REVERSE_PORT_SET" -eq 0 ]; then
         LISTEN_PORT="587"
         SERVER_PORT="587"
@@ -1414,11 +1424,17 @@ update_existing_reverse_listen_migration() {
         print_info "Dry-run: would update reverse-listen runtime defaults in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$LISTEN_PORT" "$REVERSE_PORT_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$LISTEN_PORT" "$REVERSE_PORT_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$KEEPALIVE_INTERVAL" "$KEEPALIVE_TIMEOUT" "$KEEPALIVE_SET" << 'PY'
 import sys
 import yaml
 
-config_path, reverse_port, reverse_port_set, profile, profile_set = sys.argv[1:6]
+(
+    config_path, reverse_port, reverse_port_set, profile, profile_set,
+    adaptive, adaptive_set, min_connections, min_set,
+    max_connections, max_set, scale_up_channels, scale_up_channels_set,
+    scale_up_bps, scale_up_bps_set, scale_down_idle, scale_down_set,
+    keepalive_interval, keepalive_timeout, keepalive_set,
+) = sys.argv[1:21]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1432,6 +1448,21 @@ if profile_set == '1':
 
 tunnel = data.setdefault('tunnel', {})
 tunnel.setdefault('connect_timeout', 10)
+if adaptive_set == '1':
+    tunnel['adaptive_connections'] = adaptive == '1'
+if min_set == '1':
+    tunnel['min_connections'] = int(min_connections)
+if max_set == '1':
+    tunnel['max_connections'] = int(max_connections)
+if scale_up_channels_set == '1':
+    tunnel['scale_up_active_channels'] = int(scale_up_channels)
+if scale_up_bps_set == '1':
+    tunnel['scale_up_bytes_per_second'] = int(scale_up_bps)
+if scale_down_set == '1':
+    tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
+if keepalive_set == '1':
+    tunnel['keepalive_interval'] = int(keepalive_interval)
+    tunnel['keepalive_timeout'] = int(keepalive_timeout)
 tunnel.setdefault('scale_down_noise_bytes', 65536)
 tunnel.setdefault('scale_down_noise_window_seconds', 300)
 tunnel.setdefault('short_channel_ignore_seconds', 2)
@@ -1482,7 +1513,7 @@ update_existing_reverse_dial_migration() {
         print_info "Dry-run: would update reverse-dial runtime defaults in $config_path"
         return 0
     fi
-    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
+    "$PYTHON_BIN" - "$config_path" "$SERVER_PORT" "$REVERSE_PORT_SET" "$CONNECTIONS" "$CONNECTIONS_SET" "$PERFORMANCE_PROFILE" "$PERFORMANCE_PROFILE_SET" "$ADAPTIVE_CONNECTIONS" "$ADAPTIVE_CONNECTIONS_SET" "$MIN_CONNECTIONS" "$MIN_CONNECTIONS_SET" "$MAX_CONNECTIONS" "$MAX_CONNECTIONS_SET" "$SCALE_UP_ACTIVE_CHANNELS" "$SCALE_UP_ACTIVE_CHANNELS_SET" "$SCALE_UP_BYTES_PER_SECOND" "$SCALE_UP_BYTES_PER_SECOND_SET" "$SCALE_DOWN_IDLE_SECONDS" "$SCALE_DOWN_IDLE_SECONDS_SET" "$KEEPALIVE_INTERVAL" "$KEEPALIVE_TIMEOUT" "$KEEPALIVE_SET" "$IDLE_SESSION_RECYCLE" "$IDLE_SESSION_RECYCLE_SET" << 'PY'
 import sys
 import yaml
 
@@ -1491,8 +1522,9 @@ import yaml
     profile, profile_set, adaptive, adaptive_set, min_connections, min_set,
     max_connections, max_set, scale_up_channels, scale_up_channels_set,
     scale_up_bps, scale_up_bps_set, scale_down_idle, scale_down_set,
+    keepalive_interval, keepalive_timeout, keepalive_set,
     idle_recycle, idle_recycle_set,
-) = sys.argv[1:22]
+) = sys.argv[1:25]
 with open(config_path, 'r', encoding='utf-8') as f:
     data = yaml.safe_load(f) or {}
 
@@ -1517,6 +1549,9 @@ if scale_up_bps_set == '1':
     tunnel['scale_up_bytes_per_second'] = int(scale_up_bps)
 if scale_down_set == '1':
     tunnel['scale_down_idle_seconds'] = int(scale_down_idle)
+if keepalive_set == '1':
+    tunnel['keepalive_interval'] = int(keepalive_interval)
+    tunnel['keepalive_timeout'] = int(keepalive_timeout)
 if idle_recycle_set == '1':
     tunnel['idle_session_recycle'] = idle_recycle == '1'
 tunnel.setdefault('adaptive_connections', False)
@@ -1683,6 +1718,10 @@ write_reverse_listen_config() {
         return
     fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if [ "$PRODUCTION_REVERSE_TUNING" -eq 1 ]; then
+            print_info "Existing config preserved: $config_path (use --migrate-config to apply production reverse tuning)"
+            return
+        fi
         if update_existing_performance_profile "$config_path"; then
             return
         fi
@@ -1761,8 +1800,8 @@ tunnel:
   idle_session_recycle_min_age_seconds: 3600
   idle_session_recycle_jitter_seconds: 900
   idle_session_recycle_max_per_cycle: 1
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: $KEEPALIVE_INTERVAL
+  keepalive_timeout: $KEEPALIVE_TIMEOUT
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
@@ -1850,6 +1889,10 @@ write_reverse_dial_config() {
         return
     fi
     if [ -f "$config_path" ] && [ "$MIGRATE_CONFIG" -ne 1 ] && [ "$RESET_CONFIG" -ne 1 ]; then
+        if [ "$PRODUCTION_REVERSE_TUNING" -eq 1 ]; then
+            print_info "Existing config preserved: $config_path (use --migrate-config to apply production reverse tuning)"
+            return
+        fi
         if update_existing_performance_profile "$config_path"; then
             return
         fi
@@ -1936,8 +1979,8 @@ tunnel:
   idle_session_recycle_min_age_seconds: 3600
   idle_session_recycle_jitter_seconds: 900
   idle_session_recycle_max_per_cycle: 1
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: $KEEPALIVE_INTERVAL
+  keepalive_timeout: $KEEPALIVE_TIMEOUT
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
@@ -1981,7 +2024,7 @@ export_reverse_dial_bundle() {
     bundle_path="/root/smtp-tunnel-reverse-dial-${USERNAME_VALUE:-vps}.tar.gz"
     bundle_connections="$CONNECTIONS"
     if [ "$CONNECTIONS_SET" -eq 0 ]; then
-        bundle_connections="20"
+        bundle_connections="16"
     fi
     ca_line=""
     secret_line='    # auth_secret_file: "/etc/smtp-tunnel/reverse.secret"'
@@ -2016,11 +2059,11 @@ $ca_line
 tunnel:
   connections: $bundle_connections
   adaptive_connections: true
-  min_connections: 4
-  max_connections: 20
+  min_connections: 2
+  max_connections: 16
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
-  scale_down_idle_seconds: 300
+  scale_down_idle_seconds: 180
   scale_down_noise_bytes: 65536
   scale_down_noise_window_seconds: 300
   short_channel_ignore_seconds: 2
@@ -2037,8 +2080,8 @@ tunnel:
   idle_session_recycle_min_age_seconds: 3600
   idle_session_recycle_jitter_seconds: 900
   idle_session_recycle_max_per_cycle: 1
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: 90
+  keepalive_timeout: 240
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
@@ -2136,8 +2179,8 @@ client:
   ca_cert: "ca.crt"
 
 tunnel:
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: $KEEPALIVE_INTERVAL
+  keepalive_timeout: $KEEPALIVE_TIMEOUT
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
@@ -2363,8 +2406,8 @@ EOF
     cat >> "$config_path" << EOF
 
 tunnel:
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: $KEEPALIVE_INTERVAL
+  keepalive_timeout: $KEEPALIVE_TIMEOUT
   reconnect_initial_delay: 2
   reconnect_max_delay: 60
   reconnect_jitter: 0.35
