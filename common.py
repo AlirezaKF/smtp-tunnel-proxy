@@ -15,6 +15,7 @@ import base64
 import time
 import ssl
 import logging
+import ipaddress
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -864,7 +865,7 @@ class IPWhitelist:
             # allow connection
     """
 
-    def __init__(self, entries: List[str] = None):
+    def __init__(self, entries: List[str] = None, name: str = 'IP whitelist'):
         """
         Initialize whitelist.
 
@@ -873,14 +874,14 @@ class IPWhitelist:
                     Empty list = allow all connections
         """
         self.entries = entries or []
+        self.name = name
         self._parsed = []
         self._parse_entries()
 
     def _parse_entries(self):
-        """Parse IP entries into (network, mask) tuples."""
-        import ipaddress
-
+        """Parse IP entries into ipaddress network objects."""
         for entry in self.entries:
+            entry = (entry or '').strip()
             try:
                 # Try parsing as network (CIDR notation)
                 if '/' in entry:
@@ -895,9 +896,10 @@ class IPWhitelist:
                     else:
                         network = ipaddress.ip_network(f"{entry}/128")
                     self._parsed.append(network)
-            except ValueError:
-                # Invalid entry, skip it
-                pass
+            except ValueError as e:
+                raise ValueError(
+                    f"{self.name} contains invalid IP/CIDR entry: {entry}"
+                ) from e
 
     def is_allowed(self, ip: str) -> bool:
         """
@@ -915,7 +917,6 @@ class IPWhitelist:
             return True
 
         try:
-            import ipaddress
             addr = ipaddress.ip_address(ip)
 
             for network in self._parsed:
@@ -1181,6 +1182,13 @@ def _as_str_list(value, name: str) -> List[str]:
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f"{name} entries must be non-empty strings")
         parsed.append(item.strip())
+    return parsed
+
+
+def validate_ip_whitelist_entries(entries: List[str], name: str) -> List[str]:
+    """Validate exact IP and CIDR whitelist entries, returning normalized strings."""
+    parsed = _as_str_list(entries, name)
+    IPWhitelist(parsed, name)
     return parsed
 
 
@@ -1541,7 +1549,7 @@ def build_reverse_listen_config(config_data: dict) -> ReverseListenConfig:
         auth_username=reverse_conf.get('auth_username', client_conf.get('username', '')) or '',
         auth_secret=reverse_conf.get('auth_secret', client_conf.get('secret', '')) or '',
         auth_secret_file=reverse_conf.get('auth_secret_file', client_conf.get('secret_file', '')) or '',
-        allowed_dialer_ips=_as_str_list(
+        allowed_dialer_ips=validate_ip_whitelist_entries(
             reverse_conf.get('allowed_dialer_ips', client_conf.get('reverse_allowed_dialer_ips')),
             'client.reverse.allowed_dialer_ips'
         ),
