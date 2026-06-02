@@ -724,8 +724,8 @@ client:
 tunnel:
   # 0 disables application-level keepalive for maximum compatibility with
   # older mixed-version deployments. Fresh installs use the values below.
-  keepalive_interval: 45
-  keepalive_timeout: 120
+  keepalive_interval: 90
+  keepalive_timeout: 240
 
   # Client reconnect backoff after initial failures or established tunnel loss.
   reconnect_initial_delay: 2
@@ -792,19 +792,21 @@ For reverse mode, the final tested production target for this deployment is:
 
 ```yaml
 tunnel:
-  connections: 20
+  connections: 16
   adaptive_connections: true
-  min_connections: 4
-  max_connections: 20
+  min_connections: 2
+  max_connections: 16
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
-  scale_down_idle_seconds: 300
+  scale_down_idle_seconds: 180
   scale_down_noise_bytes: 65536
   scale_down_noise_window_seconds: 300
   short_channel_ignore_seconds: 2
   short_channel_ignore_bytes: 65536
   scale_up_min_channel_age_seconds: 2
   scale_up_min_user_bytes: 65536
+  keepalive_interval: 90
+  keepalive_timeout: 240
 
 performance:
   profile: throughput
@@ -816,8 +818,8 @@ deployment testing:
 - `4`: conservative
 - `8`: improved aggregate throughput
 - `12`: good balance
-- `16`: high performance
-- `20`: recommended production value for this deployment
+- `16`: current recommended production maximum for this deployment
+- `20`: temporary fixed maximum-speed testing; larger idle footprint
 - `24`: experimental; may improve download but can hurt upload and increase noise
 - `>24`: not recommended without explicit testing
 
@@ -888,7 +890,7 @@ metrics:
 By default, reverse status is concise:
 
 ```text
-Reverse status: role=exit mode=adaptive min=4 max=20 target=4 active=4 connecting=0 active_channels=0 failures=0 user_bytes_in=... user_bytes_out=... bytes_in=... bytes_out=...
+Reverse status: role=exit mode=adaptive min=2 max=16 target=2 active=2 connecting=0 active_channels=0 failures=0 user_bytes_in=... user_bytes_out=... bytes_in=... bytes_out=...
 ```
 
 Per-session metrics are logged only when `metrics.verbose: true` or debug
@@ -950,7 +952,7 @@ Both client and server use Python's `asyncio` for efficient handling of multiple
 - In normal mode, the client role runs beside V2Ray or the application and exposes local SOCKS5.
 - In reverse mode, the Iran-side Access Node runs `client.py` with `client.mode: reverse-listen`; the VPS Exit Node runs `server.py` with `server.mode: reverse-dial`.
 - Reverse mode supports multiple VPS-to-Access tunnel sessions with `tunnel.connections`. New SOCKS channels use least-active-session selection. Existing channels on a failed session fail cleanly and new channels avoid the dead session.
-- The tested production target for this deployment is reverse port `587`, `tunnel.connections: 20`, adaptive `min_connections: 4`, `max_connections: 20`, and `performance.profile: throughput`.
+- The tested production target for this deployment is reverse port `587`, `tunnel.connections: 16`, adaptive `min_connections: 2`, `max_connections: 16`, `scale_down_idle_seconds: 180`, `keepalive_interval: 90`, `keepalive_timeout: 240`, and `performance.profile: throughput`.
 - Reverse mode requires the Access Node reverse listener port to be reachable from the VPS. NAT/CGNAT requires port forwarding or a different rendezvous/relay design.
 - Reverse mode TLS uses the Access Node certificate. Let's Encrypt HTTP-01, DNS-01/manual, existing certificates, and private CA fallback are installer-supported.
 - `scripts/bootstrap.sh` is the supported GitHub entry point for fresh installs and upgrades. It downloads a selected branch/tag/ref, then delegates to `install.sh`.
