@@ -57,10 +57,10 @@ client:
 # ============================================================================
 tunnel:
   # Application-level keepalive. Set to 0 to disable for mixed-version deployments.
-  keepalive_interval: 45
+  keepalive_interval: 90
 
   # Seconds to wait for a keepalive acknowledgement before reconnect/close.
-  keepalive_timeout: 120
+  keepalive_timeout: 240
 
   # Reconnect backoff used by client.py after failures or disconnects.
   reconnect_initial_delay: 2
@@ -71,16 +71,16 @@ tunnel:
 
   # Number of reverse-dial tunnel sessions from VPS to Access Node.
   # Normal mode and generic examples default to 1.
-  # Reverse guidance: adaptive 4-20 is the current daily production target;
+  # Reverse guidance: adaptive 2-16 is the current quieter daily production target;
   # fixed 20 is available for temporary maximum-speed testing.
   connections: 1
   # Adaptive reverse-dial mode starts fewer idle sessions and scales up under load.
   adaptive_connections: false
-  min_connections: 4
-  max_connections: 20
+  min_connections: 2
+  max_connections: 16
   scale_up_active_channels: 2
   scale_up_bytes_per_second: 131072
-  scale_down_idle_seconds: 300
+  scale_down_idle_seconds: 180
   # Noise floor controls: short DNS/DoH-style channels still pass normally,
   # but do not keep adaptive reverse sessions scaled up.
   scale_down_noise_bytes: 65536
@@ -175,13 +175,13 @@ smtp:
 #       enabled: false  # planned for Stage 1b
 #
 # tunnel:
-#   connections: 20  # tested production target for this deployment
+#   connections: 16  # current quieter production target; fixed-mode fallback
 #   adaptive_connections: true
-#   min_connections: 4
-#   max_connections: 20
+#   min_connections: 2
+#   max_connections: 16
 #   scale_up_active_channels: 2
 #   scale_up_bytes_per_second: 131072
-#   scale_down_idle_seconds: 300
+#   scale_down_idle_seconds: 180
 #   scale_down_noise_bytes: 65536
 #   scale_down_noise_window_seconds: 300
 #   short_channel_ignore_seconds: 2
